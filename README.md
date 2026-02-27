@@ -1,4 +1,4 @@
-# Nap CPUIdle Governor
+# Nap (Neural Adaptive Predictor) CPUIdle Governor
 
 A Linux kernel CPUIdle governor that uses a small neural network to learn the optimal idle state for each CPU online.
 
