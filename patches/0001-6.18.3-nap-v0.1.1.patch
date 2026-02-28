@@ -1,7 +1,7 @@
-From d6847e1d6432661ef1871ecc2ab43a584774a56d Mon Sep 17 00:00:00 2001
+From 34275af3a56ff5bed014bb20d911b3c126ac0d09 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 28 Feb 2026 08:08:36 +0900
-Subject: [PATCH] 6.18.3-nap-v0.1.0r2
+Date: Sat, 28 Feb 2026 08:56:05 +0900
+Subject: [PATCH] 6.18.3-nap-v0.1.1
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
@@ -9,11 +9,11 @@ Subject: [PATCH] 6.18.3-nap-v0.1.0r2
  drivers/cpuidle/governors/nap/Makefile        |  32 +
  drivers/cpuidle/governors/nap/nap.c           | 621 ++++++++++++++++++
  drivers/cpuidle/governors/nap/nap.h           | 258 ++++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 432 ++++++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c       | 430 ++++++++++++
  drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 162 +++++
  drivers/cpuidle/governors/nap/nap_nn_avx512.c | 197 ++++++
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 169 +++++
- 9 files changed, 1889 insertions(+)
+ 9 files changed, 1887 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -99,7 +99,7 @@ index 0000000000..325f63584c
 +CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma -mavx512f
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..c25d203bd2
+index 0000000000..430d988128
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
 @@ -0,0 +1,621 @@
@@ -144,7 +144,7 @@ index 0000000000..c25d203bd2
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.1.0"
++#define CPUIDLE_NAP_VERSION  "0.1.1"
 +
 +/* Governor defaults */
 +#define NAP_DEFAULT_LR_MILLTHS    1     /* 0.001 = 1 millths */
@@ -694,7 +694,7 @@ index 0000000000..c25d203bd2
 +
 +static struct cpuidle_governor nap_governor = {
 +	.name    = "nap",
-+	.rating  = 15,
++	.rating  = 26,
 +	.enable  = nap_enable,
 +	.disable = nap_disable,
 +	.select  = nap_select,
@@ -990,10 +990,10 @@ index 0000000000..b2871942df
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000..335ea5e03d
+index 0000000000..86d6102015
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,430 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1369,15 +1369,13 @@ index 0000000000..335ea5e03d
 +	/* Deferred learning (always, even during warmup) */
 +	if (d->needs_learn) {
 +		int ideal = compute_ideal_state(drv, d->learn_actual_ns);
++		int nn_best = nap_nn_argmax(d->nn_output, drv->state_count);
++		bool hit = (nn_best == ideal);
 +
 +		d->stats.learn_count++;
 +
 +		/* Track NN accuracy for convergence detection */
 +		if (!d->converged) {
-+			int nn_best = nap_nn_argmax(d->nn_output,
-+						    drv->state_count);
-+			bool hit = (nn_best == ideal);
-+
 +			d->ema_accuracy += (hit ? 64 : 0)
 +					   - (d->ema_accuracy >> 4);
 +
@@ -1392,7 +1390,7 @@ index 0000000000..335ea5e03d
 +			}
 +		}
 +
-+		if (ideal != d->last_selected_idx)
++		if (!hit)
 +			nap_nn_learn(d, ideal);
 +		d->needs_learn = false;
 +	}
