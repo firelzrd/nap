@@ -1,7 +1,7 @@
-From 059609bd81f787878f7bd8449e8d53e8d2d315ae Mon Sep 17 00:00:00 2001
+From 864a75138f01f018d59f248f5835c0111298f7c3 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 1 Mar 2026 02:44:52 +0900
-Subject: [PATCH] 6.18.3-nap-v0.1.5
+Date: Sun, 1 Mar 2026 07:54:59 +0900
+Subject: [PATCH] 6.18.3-nap-v0.1.5r2
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
@@ -10,10 +10,10 @@ Subject: [PATCH] 6.18.3-nap-v0.1.5
  drivers/cpuidle/governors/nap/nap.c           | 636 ++++++++++++++++++
  drivers/cpuidle/governors/nap/nap.h           | 260 +++++++
  drivers/cpuidle/governors/nap/nap_fpu.c       | 472 +++++++++++++
- drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 193 ++++++
- drivers/cpuidle/governors/nap/nap_nn_avx512.c | 206 ++++++
+ drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 201 ++++++
+ drivers/cpuidle/governors/nap/nap_nn_avx512.c | 192 ++++++
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 160 +++++
- 9 files changed, 1977 insertions(+)
+ 9 files changed, 1971 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -1485,10 +1485,10 @@ index 0000000000..4f88baf4d0
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx2.c b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
 new file mode 100644
-index 0000000000..44dccca095
+index 0000000000..f313767b90
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,201 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx2.c — AVX2+FMA forward pass and backpropagation for the nap MLP
@@ -1505,10 +1505,18 @@ index 0000000000..44dccca095
 +static inline v8sf v8sf_load(const float *p)   { return *(const v8sf *)p; }
 +static inline void v8sf_store(float *p, v8sf v) { *(v8sf *)p = v; }
 +
-+/* FMA: a*b+c → vfmadd231ps */
++/* FMA: a*b+c — inline asm guarantees a single vfmaddps instruction
++ * on both GCC and Clang without relying on compiler-specific builtins
++ * or -ffp-contract settings.
++ *
++ * vfmadd231ps chosen over 213: the accumulator/destination is c ("+x"),
++ * so live-through registers like v_neg_lr in the learn pass stay in
++ * read-only operands and need no extra vmovaps copy. */
 +static inline v8sf v8sf_fmadd(v8sf a, v8sf b, v8sf c)
 +{
-+	return __builtin_ia32_vfmaddps256(a, b, c);
++	/* vfmadd231ps: dest = src1 * src2 + dest → c = a*b + c */
++	asm("vfmadd231ps %2, %1, %0" : "+x"(c) : "x"(a), "xm"(b));
++	return c;
 +}
 +
 +void nap_nn_forward_avx2(const float *input,
@@ -1684,10 +1692,10 @@ index 0000000000..44dccca095
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx512.c b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
 new file mode 100644
-index 0000000000..ee57b66897
+index 0000000000..6ca0b21b56
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,192 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx512.c — AVX-512F forward pass and backpropagation for the nap MLP
@@ -1701,46 +1709,32 @@ index 0000000000..ee57b66897
 +
 +#include "nap.h"
 +
-+/* __mmask16 is not available without immintrin.h in kernel space */
-+typedef unsigned short __mmask16;
-+
 +/*
-+ * Portable zmm max/min wrappers.
++ * Inline asm wrappers for AVX-512F operations.
 + *
-+ * GCC exposes masked 5-argument builtins:
-+ *   __builtin_ia32_maxps512_mask(a, b, passthrough, mask, rounding)
-+ * Clang exposes unmasked 3-argument builtins:
-+ *   __builtin_ia32_maxps512(a, b, rounding)
-+ * Both produce the same vmaxps/vminps zmm instruction when the mask
-+ * is all-ones (0xFFFF) and the rounding mode is current-direction (0x04).
++ * Eliminates all #ifdef __clang__ / GCC builtin differences.
++ * "v" constraint = xmm/ymm/zmm (AVX-512 register class).
++ * The assembler selects EVEX encoding automatically for zmm operands.
 + */
-+#ifdef __clang__
 +static inline v16sf v16sf_max(v16sf a, v16sf b)
 +{
-+	return __builtin_ia32_maxps512(a, b, 0x04 /* _MM_FROUND_CUR_DIRECTION */);
++	asm("vmaxps %2, %1, %0" : "=v"(a) : "v"(a), "vm"(b));
++	return a;
 +}
-+static inline v16sf v16sf_min(v16sf a, v16sf b)
-+{
-+	return __builtin_ia32_minps512(a, b, 0x04);
-+}
-+#else
-+static inline v16sf v16sf_max(v16sf a, v16sf b)
-+{
-+	return __builtin_ia32_maxps512_mask(a, b, a, (__mmask16)0xFFFF, 0x04);
-+}
-+static inline v16sf v16sf_min(v16sf a, v16sf b)
-+{
-+	return __builtin_ia32_minps512_mask(a, b, a, (__mmask16)0xFFFF, 0x04);
-+}
-+#endif
 +
-+/* FMA: a*b+c → vfmadd231ps zmm
-+ * gcc-12+ uses _mask variant with full mask (0xFFFF) for 16 lanes. */
++static inline v16sf v16sf_min(v16sf a, v16sf b)
++{
++	asm("vminps %2, %1, %0" : "=v"(a) : "v"(a), "vm"(b));
++	return a;
++}
++
++/* FMA: a*b+c — vfmadd231ps with c as read-write destination,
++ * matching the accumulator pattern used in forward/learn passes. */
 +static inline v16sf v16sf_fmadd(v16sf a, v16sf b, v16sf c)
 +{
-+	return __builtin_ia32_vfmaddps512_mask(a, b, c,
-+					       (__mmask16)0xFFFF,
-+					       0x04 /* _MM_FROUND_CUR_DIRECTION */);
++	/* vfmadd231ps: dest = src1 * src2 + dest → c = a*b + c */
++	asm("vfmadd231ps %2, %1, %0" : "+v"(c) : "v"(a), "vm"(b));
++	return c;
 +}
 +
 +void nap_nn_forward_avx512(const float *input,
