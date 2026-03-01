@@ -1,7 +1,7 @@
-From 4be9a251223f7a5792519bdf97831cac99d383e6 Mon Sep 17 00:00:00 2001
+From e74d5ea717a83cb1c1856ae2eb2c0d13c30f6f89 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 2 Mar 2026 00:20:48 +0900
-Subject: [PATCH] 6.18.3-nap-v0.1.7
+Date: Mon, 2 Mar 2026 00:46:32 +0900
+Subject: [PATCH] 6.18.3-nap-v0.1.7r2
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
@@ -11,9 +11,9 @@ Subject: [PATCH] 6.18.3-nap-v0.1.7
  drivers/cpuidle/governors/nap/nap.h           | 264 ++++++++
  drivers/cpuidle/governors/nap/nap_fpu.c       | 472 +++++++++++++
  drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 221 ++++++
- drivers/cpuidle/governors/nap/nap_nn_avx512.c | 243 +++++++
+ drivers/cpuidle/governors/nap/nap_nn_avx512.c | 239 +++++++
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 160 +++++
- 9 files changed, 2047 insertions(+)
+ 9 files changed, 2043 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -1717,10 +1717,10 @@ index 0000000000..0f800d43f5
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx512.c b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
 new file mode 100644
-index 0000000000..8602497775
+index 0000000000..83ef75e4b8
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,239 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx512.c — AVX-512F forward pass and backpropagation for the nap MLP
@@ -1863,11 +1863,7 @@ index 0000000000..8602497775
 +static noinline void
 +learn_avx512_output(struct nap_cpu_data *d, int ideal, float *d_out)
 +{
-+void nap_nn_learn_avx512(struct nap_cpu_data *d, int ideal)
-+{
 +	int j;
-+	float *d_out = d->learn_d_out;
-+	float *d_hid = d->learn_d_hid;
 +	float lr = (float)d->learning_rate_millths / 1000.0f;
 +	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
 +	v16sf v16_neg_lr = V16SF_SET1(-lr);
