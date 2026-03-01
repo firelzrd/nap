@@ -1,19 +1,19 @@
-From 1f09038a9a6094b0fb31cda35b101aefdc11d418 Mon Sep 17 00:00:00 2001
+From 4be9a251223f7a5792519bdf97831cac99d383e6 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 1 Mar 2026 18:46:50 +0900
-Subject: [PATCH] 6.18.3-nap-v0.1.6
+Date: Mon, 2 Mar 2026 00:20:48 +0900
+Subject: [PATCH] 6.18.3-nap-v0.1.7
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
  drivers/cpuidle/governors/Makefile            |   1 +
- drivers/cpuidle/governors/nap/Makefile        |  32 +
+ drivers/cpuidle/governors/nap/Makefile        |  33 +
  drivers/cpuidle/governors/nap/nap.c           | 636 ++++++++++++++++++
- drivers/cpuidle/governors/nap/nap.h           | 260 +++++++
+ drivers/cpuidle/governors/nap/nap.h           | 264 ++++++++
  drivers/cpuidle/governors/nap/nap_fpu.c       | 472 +++++++++++++
  drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 221 ++++++
- drivers/cpuidle/governors/nap/nap_nn_avx512.c | 239 +++++++
+ drivers/cpuidle/governors/nap/nap_nn_avx512.c | 243 +++++++
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 160 +++++
- 9 files changed, 2038 insertions(+)
+ 9 files changed, 2047 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -61,10 +61,10 @@ index 63abb5393a..ae688891c0 100644
 +obj-$(CONFIG_CPU_IDLE_GOV_NAP) += nap/
 diff --git a/drivers/cpuidle/governors/nap/Makefile b/drivers/cpuidle/governors/nap/Makefile
 new file mode 100644
-index 0000000000..325f63584c
+index 0000000000..bb983497a4
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/Makefile
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +# SPDX-License-Identifier: GPL-2.0-only
 +#
 +# Makefile for the NAP cpuidle governor
@@ -96,10 +96,11 @@ index 0000000000..325f63584c
 +CFLAGS_nap_fpu.o       += $(CC_FLAGS_FPU)
 +CFLAGS_nap_nn_sse2.o   += $(CC_FLAGS_FPU)
 +CFLAGS_nap_nn_avx2.o   += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma
-+CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma -mavx512f
++CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma -mavx512f \
++			   -Wframe-larger-than=4096
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..1e0a40eb59
+index 0000000000..e9a9c225de
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
 @@ -0,0 +1,636 @@
@@ -145,7 +146,7 @@ index 0000000000..1e0a40eb59
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.1.6"
++#define CPUIDLE_NAP_VERSION  "0.1.7"
 +
 +/* Governor defaults */
 +#define NAP_DEFAULT_LR_MILLTHS    1     /* 0.001 = 1 millths */
@@ -741,10 +742,10 @@ index 0000000000..1e0a40eb59
 +postcore_initcall(nap_init);
 diff --git a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
 new file mode 100644
-index 0000000000..ca65f9268b
+index 0000000000..aa17bce33b
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.h
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,264 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef NAP_H
 +#define NAP_H
@@ -971,6 +972,10 @@ index 0000000000..ca65f9268b
 +	float nn_output[NAP_OUTPUT_STRIDE] __aligned(64);
 +	float hidden_out[NAP_HIDDEN_SIZE] __aligned(64);
 +	float features_f32[NAP_NUM_FEATURES] __aligned(64);
++
++	/* Backprop scratch (avoids 64-byte-aligned stack arrays) */
++	float learn_d_out[NAP_OUTPUT_STRIDE] __aligned(64);
++	float learn_d_hid[NAP_HIDDEN_SIZE] __aligned(64);
 +
 +	/* Deferred learning data */
 +	bool  needs_learn;
@@ -1485,7 +1490,7 @@ index 0000000000..4f88baf4d0
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx2.c b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
 new file mode 100644
-index 0000000000..8e61d36d88
+index 0000000000..0f800d43f5
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
 @@ -0,0 +1,221 @@
@@ -1629,8 +1634,8 @@ index 0000000000..8e61d36d88
 +void nap_nn_learn_avx2(struct nap_cpu_data *d, int ideal)
 +{
 +	int i, j;
-+	float d_out[NAP_OUTPUT_STRIDE] __aligned(32);
-+	float d_hid[NAP_HIDDEN_SIZE] __aligned(32);
++	float *d_out = d->learn_d_out;
++	float *d_hid = d->learn_d_hid;
 +	float lr = (float)d->learning_rate_millths / 1000.0f;
 +	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
 +	v8sf v_neg_lr = V8SF_SET1(-lr);
@@ -1712,10 +1717,10 @@ index 0000000000..8e61d36d88
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx512.c b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
 new file mode 100644
-index 0000000000..83ef75e4b8
+index 0000000000..8602497775
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,243 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx512.c — AVX-512F forward pass and backpropagation for the nap MLP
@@ -1858,7 +1863,11 @@ index 0000000000..83ef75e4b8
 +static noinline void
 +learn_avx512_output(struct nap_cpu_data *d, int ideal, float *d_out)
 +{
++void nap_nn_learn_avx512(struct nap_cpu_data *d, int ideal)
++{
 +	int j;
++	float *d_out = d->learn_d_out;
++	float *d_hid = d->learn_d_hid;
 +	float lr = (float)d->learning_rate_millths / 1000.0f;
 +	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
 +	v16sf v16_neg_lr = V16SF_SET1(-lr);
@@ -1957,7 +1966,7 @@ index 0000000000..83ef75e4b8
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_sse2.c b/drivers/cpuidle/governors/nap/nap_nn_sse2.c
 new file mode 100644
-index 0000000000..bf49415014
+index 0000000000..79ae0aece3
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_sse2.c
 @@ -0,0 +1,160 @@
@@ -2045,8 +2054,8 @@ index 0000000000..bf49415014
 +void nap_nn_learn_sse2(struct nap_cpu_data *d, int ideal)
 +{
 +	int i, j;
-+	float d_out[NAP_OUTPUT_STRIDE] __aligned(16);
-+	float d_hid[NAP_HIDDEN_SIZE] __aligned(16);
++	float *d_out = d->learn_d_out;
++	float *d_hid = d->learn_d_hid;
 +	float lr = (float)d->learning_rate_millths / 1000.0f;
 +	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
 +	v4sf v_lr    = V4SF_SET1(lr);
