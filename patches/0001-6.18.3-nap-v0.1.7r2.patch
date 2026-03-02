@@ -1,7 +1,7 @@
 From e74d5ea717a83cb1c1856ae2eb2c0d13c30f6f89 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Mon, 2 Mar 2026 00:46:32 +0900
-Subject: [PATCH] 6.18.3-nap-v0.1.7r2
+Subject: [PATCH] 6.18.3-nap-v0.1.7r3
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
@@ -1644,7 +1644,7 @@ index 0000000000..0f800d43f5
 +	v8sf vd_lo, vd_hi;
 +
 +	/* Output error: nn_output - one_hot(ideal) */
-+	__builtin_memcpy(d_out, d->nn_output, sizeof(d_out));
++	__builtin_memcpy(d_out, d->nn_output, NAP_OUTPUT_STRIDE * sizeof(float));
 +	d_out[ideal] -= 1.0f;
 +
 +	vd_lo = v8sf_load(&d_out[0]);
@@ -2060,7 +2060,7 @@ index 0000000000..79ae0aece3
 +	v4sf vd0, vd1, vd2, vd3;
 +
 +	/* Output error: nn_output - one_hot(ideal) */
-+	__builtin_memcpy(d_out, d->nn_output, sizeof(d_out));
++	__builtin_memcpy(d_out, d->nn_output, NAP_OUTPUT_STRIDE * sizeof(float));
 +	d_out[ideal] -= 1.0f;
 +
 +	vd0 = *(const v4sf *)&d_out[0];
