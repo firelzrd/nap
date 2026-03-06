@@ -2,6 +2,8 @@
 
 A Linux kernel CPUIdle governor that uses a MLP-based neural network to learn the optimal idle state for each CPU online.
 
+<div align="center"><img width="416" height="369" alt="nap" src="https://github.com/user-attachments/assets/a2861a8d-15cf-4b0e-9c09-6c86001ebbb7" /></div>
+
 ## Overview
 
 Traditional CPUIdle governors (`ladder`, `menu`, `teo`) rely on fixed heuristics to predict how long a CPU will sleep and select an idle state accordingly. These heuristics are effective for common patterns but struggle with irregular or shifting workloads.
@@ -84,16 +86,14 @@ Exposed under `/sys/devices/system/cpu/cpuidle/nap/`:
 
 | Tunable | Default | Description |
 |---|---|---|
-| `version` | *(read-only)* | Governor version (0.2.0) |
+| `version` | *(read-only)* | Governor version |
 | `simd` | *(read-only)* | Detected SIMD capability (`sse2` / `avx2` / `avx512`) |
-| `converged` | *(read-only)* | Whether the network has converged |
-| `stats` | *(read-only)* | Total selects, residency, overshoot rate, learn count |
-| `ema_accuracy` | *(read-only)* | Exponential moving average of prediction accuracy |
-| `learning_mode` | `1` | Enable (`1`) or disable (`0`) online learning |
-| `learning_rate_millths` | `1` | Learning rate in thousandths (0.001) |
+| `stats` | *(read-only)* | Total selects, residency, overshoot count/rate, learn count, converged CPUs |
+| `ema_accuracy` | *(read-only)* | Min/avg/max prediction accuracy (x1024 scale) and converged CPUs |
+| `learning_mode` | `online` | Set `online` or `off`; reads back `off` / `online` / `warmup (N/M converged)` |
+| `learning_rate` | `1` | Learning rate in thousandths (1 = 0.001) |
 | `learn_interval` | `4` | Backpropagation frequency (every N reflects) |
-| `max_grad_norm_millths` | `1000` | Gradient clipping threshold in thousandths (1.0) |
-| `overshoot_pctl_millths` | `50` | Target overshoot percentile in thousandths (0.05 = 5%) |
+| `overshoot_pctl` | `50` | Target overshoot percentile in thousandths (50 = 5%) |
 | `warmup_threshold` | `64` | Minimum learning steps before convergence check |
 | `convergence_thresh` | `768` | Accuracy threshold (x1024 scale, 768 = 75%) |
 | `reset_weights` | *(write-only)* | Trigger weight reinitialization (`all` or cpulist e.g. `0-3,5,7`) |
