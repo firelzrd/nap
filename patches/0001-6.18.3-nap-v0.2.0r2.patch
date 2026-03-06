@@ -1,7 +1,7 @@
-From 9295e239d7fb1a597c6036e091613b61e5cbd38b Mon Sep 17 00:00:00 2001
+From 8675f9fb5c44b074894ba2045923ac8e17a3e587 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 5 Mar 2026 23:42:32 +0900
-Subject: [PATCH] 6.18.3-nap-v0.2.0
+Date: Fri, 6 Mar 2026 13:54:25 +0900
+Subject: [PATCH] 6.18.3-nap-v0.2.0r2
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
@@ -9,11 +9,11 @@ Subject: [PATCH] 6.18.3-nap-v0.2.0
  drivers/cpuidle/governors/nap/Makefile        |  33 +
  drivers/cpuidle/governors/nap/nap.c           | 680 ++++++++++++++++++
  drivers/cpuidle/governors/nap/nap.h           | 276 +++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 609 ++++++++++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c       | 626 ++++++++++++++++
  drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 207 ++++++
  drivers/cpuidle/governors/nap/nap_nn_avx512.c | 203 ++++++
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 154 ++++
- 9 files changed, 2180 insertions(+)
+ 9 files changed, 2197 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -1068,10 +1068,10 @@ index 0000000000..6216d31492
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000..1b957c44f5
+index 0000000000..3fe79977e6
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,609 @@
+@@ -0,0 +1,626 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1096,12 +1096,29 @@ index 0000000000..1b957c44f5
 +
 +#include "nap.h"
 +
++/* Clang lacks __builtin_ia32_movhlps; emulate with __builtin_shufflevector */
++#ifdef __clang__
++#define __builtin_ia32_movhlps(a, b) \
++	__builtin_shufflevector(b, a, 2, 3, 6, 7)
++#endif
++
 +/* ================================================================
 + * Float math helpers
 + * ================================================================ */
 +
 +static inline float float_min(float a, float b) { return a < b ? a : b; }
 +static inline float float_max(float a, float b) { return a > b ? a : b; }
++
++/*
++ * Kernel-safe sqrtf using the SSE sqrtss instruction directly.
++ * GCC may lower nap_sqrtf to a libm call, which is unavailable
++ * in the kernel.  This file is always compiled with FPU/SSE enabled.
++ */
++static inline float nap_sqrtf(float x)
++{
++	asm("sqrtss %1, %0" : "=x"(x) : "x"(x));
++	return x;
++}
 +
 +/* Scalar log2 approximation (same algorithm as fast_log2f_sse) */
 +static inline float fast_log2f(float x)
@@ -1181,7 +1198,7 @@ index 0000000000..1b957c44f5
 +	int i, j;
 +
 +	/* Xavier uniform: U(-sqrt(6/(fan_in+fan_out)), +sqrt(6/(...))) */
-+	scale_h1  = __builtin_sqrtf(6.0f / (float)(NAP_INPUT_SIZE + NAP_HIDDEN_SIZE));
++	scale_h1  = nap_sqrtf(6.0f / (float)(NAP_INPUT_SIZE + NAP_HIDDEN_SIZE));
 +	scale_out = 0.01f;
 +
 +	/* Hidden layer weights */
@@ -1337,7 +1354,7 @@ index 0000000000..1b957c44f5
 +
 +	/* Var = E[x²] - E[x]² — single-pass, no second loop needed */
 +	diff = sq_sum * inv_n - avg * avg;
-+	s->stdev = __builtin_sqrtf(float_max(diff, 0.0f));
++	s->stdev = nap_sqrtf(float_max(diff, 0.0f));
 +
 +	/* Trend: compare older half vs recent half of the ring buffer */
 +	if (n < NAP_HISTORY_SIZE || avg == 0.0f) {
