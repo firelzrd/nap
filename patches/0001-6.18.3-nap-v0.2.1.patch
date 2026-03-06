@@ -1,19 +1,19 @@
-From 8675f9fb5c44b074894ba2045923ac8e17a3e587 Mon Sep 17 00:00:00 2001
+From f4287e58711e828c2c14c627d8306504be275e0a Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 6 Mar 2026 13:54:25 +0900
-Subject: [PATCH] 6.18.3-nap-v0.2.0r2
+Date: Sat, 7 Mar 2026 04:38:36 +0900
+Subject: [PATCH] 6.18.3-nap-v0.2.1
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
  drivers/cpuidle/governors/Makefile            |   1 +
  drivers/cpuidle/governors/nap/Makefile        |  33 +
- drivers/cpuidle/governors/nap/nap.c           | 680 ++++++++++++++++++
- drivers/cpuidle/governors/nap/nap.h           | 276 +++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 626 ++++++++++++++++
- drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 207 ++++++
+ drivers/cpuidle/governors/nap/nap.c           | 529 ++++++++++++++++
+ drivers/cpuidle/governors/nap/nap.h           | 271 ++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c       | 577 ++++++++++++++++++
+ drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 207 +++++++
  drivers/cpuidle/governors/nap/nap_nn_avx512.c | 203 ++++++
- drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 154 ++++
- 9 files changed, 2197 insertions(+)
+ drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 154 +++++
+ 9 files changed, 1992 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -100,10 +100,10 @@ index 0000000000..bb983497a4
 +			   -Wframe-larger-than=4096
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..4af469ab0f
+index 0000000000..9ff4d9f0b9
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,529 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap.c — Neural Adaptive Predictor cpuidle governor
@@ -147,15 +147,13 @@ index 0000000000..4af469ab0f
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.2.0"
++#define CPUIDLE_NAP_VERSION  "0.2.1"
 +
 +/* Governor defaults */
 +#define NAP_DEFAULT_LR_MILLTHS    1     /* 0.001 = 1 millths */
 +#define NAP_DEFAULT_INTERVAL      4     /* learn every 4 reflects */
 +#define NAP_DEFAULT_CLAMP_MILLTHS 1000  /* 1.0 = 1000 millths */
 +#define NAP_DEFAULT_PCTL_MILLTHS  50    /* 5th percentile (conservative) */
-+#define NAP_DEFAULT_WARMUP        64    /* min learns before convergence check */
-+#define NAP_DEFAULT_CONVERGE      768   /* 75% accuracy (x1024 scale) */
 +
 +/* ================================================================
 + * ISA dispatch via static keys (definitions only; dispatch in nap_fpu.c)
@@ -315,7 +313,7 @@ index 0000000000..4af469ab0f
 +	d->last_prediction_error = d->last_predicted_ns - (s64)measured_ns;
 +	nap_update_external_signals(d, dev->cpu);
 +
-+	if (d->learning_mode && ++d->learn_counter >= d->learn_interval) {
++	if (++d->learn_counter >= d->learn_interval) {
 +		d->learn_counter = 0;
 +		d->learn_actual_ns = measured_ns;
 +		d->needs_learn = true;
@@ -341,13 +339,10 @@ index 0000000000..4af469ab0f
 +	 * happens on the correct CPU in its own idle context.
 +	 */
 +	WRITE_ONCE(nap_cached_drv, drv);
-+	d->learning_mode  = true;
 +	d->learning_rate_millths  = NAP_DEFAULT_LR_MILLTHS;
 +	d->learn_interval = NAP_DEFAULT_INTERVAL;
 +	d->max_grad_norm_millths  = NAP_DEFAULT_CLAMP_MILLTHS;
 +	d->overshoot_pctl_millths = NAP_DEFAULT_PCTL_MILLTHS;
-+	d->warmup_threshold = NAP_DEFAULT_WARMUP;
-+	d->convergence_thresh = NAP_DEFAULT_CONVERGE;
 +	d->reset_pending = true;
 +
 +	return 0;
@@ -368,7 +363,6 @@ index 0000000000..4af469ab0f
 +{
 +	int cpu, len = 0;
 +	u64 total_sel = 0, total_res = 0, total_under = 0, total_learn = 0;
-+	int converged_cpus = 0, online_cpus = 0;
 +
 +	for_each_online_cpu(cpu) {
 +		struct nap_cpu_data *d = &per_cpu(nap_data, cpu);
@@ -377,9 +371,6 @@ index 0000000000..4af469ab0f
 +		total_res   += d->stats.total_residency_ns;
 +		total_under += d->stats.overshoot_count;
 +		total_learn += d->stats.learn_count;
-+		if (d->converged)
-+			converged_cpus++;
-+		online_cpus++;
 +	}
 +
 +	len += sysfs_emit_at(buf, len, "total_selects: %llu\n", total_sel);
@@ -389,56 +380,7 @@ index 0000000000..4af469ab0f
 +	len += sysfs_emit_at(buf, len, "overshoot_rate_permil: %llu\n",
 +			     total_sel ? div_u64(total_under * 1000, total_sel) : 0);
 +	len += sysfs_emit_at(buf, len, "learn_count: %llu\n", total_learn);
-+	len += sysfs_emit_at(buf, len, "converged_cpus: %d/%d\n",
-+			     converged_cpus, online_cpus);
 +	return len;
-+}
-+
-+static ssize_t learning_mode_show(struct kobject *kobj,
-+				  struct kobj_attribute *attr, char *buf)
-+{
-+	int cpu, learning = 0, converged = 0, total = 0;
-+
-+	for_each_online_cpu(cpu) {
-+		struct nap_cpu_data *d = &per_cpu(nap_data, cpu);
-+
-+		if (d->learning_mode)
-+			learning++;
-+		if (d->converged)
-+			converged++;
-+		total++;
-+	}
-+
-+	if (total == 0)
-+		return sysfs_emit(buf, "off\n");
-+
-+	if (learning == 0)
-+		return sysfs_emit(buf, "off\n");
-+	else if (converged == total)
-+		return sysfs_emit(buf, "online\n");
-+	else
-+		return sysfs_emit(buf, "warmup (%d/%d converged)\n",
-+				  converged, total);
-+}
-+
-+static ssize_t learning_mode_store(struct kobject *kobj,
-+				   struct kobj_attribute *attr,
-+				   const char *buf, size_t count)
-+{
-+	bool mode;
-+	int cpu;
-+
-+	if (sysfs_streq(buf, "online"))
-+		mode = true;
-+	else if (sysfs_streq(buf, "off"))
-+		mode = false;
-+	else
-+		return -EINVAL;
-+
-+	for_each_online_cpu(cpu)
-+		per_cpu(nap_data, cpu).learning_mode = mode;
-+
-+	return count;
 +}
 +
 +static ssize_t learning_rate_show(struct kobject *kobj,
@@ -552,62 +494,6 @@ index 0000000000..4af469ab0f
 +	return count;
 +}
 +
-+static ssize_t warmup_threshold_show(struct kobject *kobj,
-+				     struct kobj_attribute *attr, char *buf)
-+{
-+	int cpu;
-+
-+	cpu = cpumask_first(cpu_online_mask);
-+	if (cpu >= nr_cpu_ids)
-+		return sysfs_emit(buf, "0\n");
-+	return sysfs_emit(buf, "%u\n",
-+			  per_cpu(nap_data, cpu).warmup_threshold);
-+}
-+
-+static ssize_t warmup_threshold_store(struct kobject *kobj,
-+				      struct kobj_attribute *attr,
-+				      const char *buf, size_t count)
-+{
-+	unsigned int val;
-+	int cpu;
-+
-+	if (kstrtouint(buf, 10, &val) || val > 100000)
-+		return -EINVAL;
-+
-+	for_each_online_cpu(cpu)
-+		per_cpu(nap_data, cpu).warmup_threshold = val;
-+
-+	return count;
-+}
-+
-+static ssize_t convergence_thresh_show(struct kobject *kobj,
-+				       struct kobj_attribute *attr, char *buf)
-+{
-+	int cpu;
-+
-+	cpu = cpumask_first(cpu_online_mask);
-+	if (cpu >= nr_cpu_ids)
-+		return sysfs_emit(buf, "0\n");
-+	return sysfs_emit(buf, "%u\n",
-+			  per_cpu(nap_data, cpu).convergence_thresh);
-+}
-+
-+static ssize_t convergence_thresh_store(struct kobject *kobj,
-+					struct kobj_attribute *attr,
-+					const char *buf, size_t count)
-+{
-+	unsigned int val;
-+	int cpu;
-+
-+	if (kstrtouint(buf, 10, &val) || val > 1024)
-+		return -EINVAL;
-+
-+	for_each_online_cpu(cpu)
-+		per_cpu(nap_data, cpu).convergence_thresh = val;
-+
-+	return count;
-+}
-+
 +static ssize_t overshoot_pctl_show(struct kobject *kobj,
 +				    struct kobj_attribute *attr, char *buf)
 +{
@@ -636,35 +522,6 @@ index 0000000000..4af469ab0f
 +	return count;
 +}
 +
-+static ssize_t ema_accuracy_show(struct kobject *kobj,
-+				 struct kobj_attribute *attr, char *buf)
-+{
-+	int cpu;
-+	unsigned int ema_min = 1024, ema_max = 0;
-+	unsigned long ema_sum = 0;
-+	int converged = 0, total = 0;
-+
-+	for_each_online_cpu(cpu) {
-+		struct nap_cpu_data *d = &per_cpu(nap_data, cpu);
-+
-+		if (d->ema_accuracy < ema_min)
-+			ema_min = d->ema_accuracy;
-+		if (d->ema_accuracy > ema_max)
-+			ema_max = d->ema_accuracy;
-+		ema_sum += d->ema_accuracy;
-+		if (d->converged)
-+			converged++;
-+		total++;
-+	}
-+
-+	if (total == 0)
-+		return sysfs_emit(buf, "no cpus online\n");
-+
-+	return sysfs_emit(buf, "min/avg/max: %u/%lu/%u (x1024)\nconverged: %d/%d\n",
-+			  ema_min, ema_sum / total, ema_max,
-+			  converged, total);
-+}
-+
 +static ssize_t version_show(struct kobject *kobj,
 +			    struct kobj_attribute *attr, char *buf)
 +{
@@ -682,30 +539,22 @@ index 0000000000..4af469ab0f
 +		return sysfs_emit(buf, "sse2\n");
 +}
 +
-+static struct kobj_attribute version_attr            = __ATTR_RO(version);
-+static struct kobj_attribute simd_attr               = __ATTR_RO(simd);
-+static struct kobj_attribute stats_attr              = __ATTR_RO(stats);
-+static struct kobj_attribute learning_mode_attr      = __ATTR_RW(learning_mode);
-+static struct kobj_attribute learning_rate_attr      = __ATTR_RW(learning_rate);
-+static struct kobj_attribute learn_interval_attr     = __ATTR_RW(learn_interval);
-+static struct kobj_attribute warmup_threshold_attr   = __ATTR_RW(warmup_threshold);
-+static struct kobj_attribute convergence_thresh_attr = __ATTR_RW(convergence_thresh);
-+static struct kobj_attribute overshoot_pctl_attr    = __ATTR_RW(overshoot_pctl);
-+static struct kobj_attribute ema_accuracy_attr       = __ATTR_RO(ema_accuracy);
-+static struct kobj_attribute reset_weights_attr      = __ATTR_WO(reset_weights);
-+static struct kobj_attribute reset_stats_attr        = __ATTR_WO(reset_stats);
++static struct kobj_attribute version_attr        = __ATTR_RO(version);
++static struct kobj_attribute simd_attr           = __ATTR_RO(simd);
++static struct kobj_attribute stats_attr          = __ATTR_RO(stats);
++static struct kobj_attribute learning_rate_attr  = __ATTR_RW(learning_rate);
++static struct kobj_attribute learn_interval_attr = __ATTR_RW(learn_interval);
++static struct kobj_attribute overshoot_pctl_attr = __ATTR_RW(overshoot_pctl);
++static struct kobj_attribute reset_weights_attr  = __ATTR_WO(reset_weights);
++static struct kobj_attribute reset_stats_attr    = __ATTR_WO(reset_stats);
 +
 +static struct attribute *nap_attrs[] = {
 +	&version_attr.attr,
 +	&simd_attr.attr,
 +	&stats_attr.attr,
-+	&learning_mode_attr.attr,
 +	&learning_rate_attr.attr,
 +	&learn_interval_attr.attr,
-+	&warmup_threshold_attr.attr,
-+	&convergence_thresh_attr.attr,
 +	&overshoot_pctl_attr.attr,
-+	&ema_accuracy_attr.attr,
 +	&reset_weights_attr.attr,
 +	&reset_stats_attr.attr,
 +	NULL,
@@ -786,10 +635,10 @@ index 0000000000..4af469ab0f
 +postcore_initcall(nap_init);
 diff --git a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
 new file mode 100644
-index 0000000000..6216d31492
+index 0000000000..c99f296c89
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.h
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,271 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef NAP_H
 +#define NAP_H
@@ -1038,16 +887,11 @@ index 0000000000..6216d31492
 +	float expert_mid;		/* log2 threshold for expert selection */
 +
 +	/* Online learning */
-+	bool  learning_mode;
 +	unsigned int learning_rate_millths;
 +	unsigned int max_grad_norm_millths;
 +	unsigned int overshoot_pctl_millths; /* quantile target (250 = 25th pctl) */
 +	int   learn_interval;
 +	int   learn_counter;
-+	unsigned int warmup_threshold;	/* min learns before convergence check */
-+	unsigned int convergence_thresh;	/* EMA accuracy threshold (x1024) */
-+	unsigned int ema_accuracy;	/* EMA of NN hit rate (x1024 = 100%) */
-+	bool converged;			/* true after NN accuracy converges */
 +	bool reset_pending;		/* set by sysfs, consumed by nap_select */
 +
 +	/* sysfs statistics */
@@ -1068,10 +912,10 @@ index 0000000000..6216d31492
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000..3fe79977e6
+index 0000000000..8f07939904
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,577 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1502,33 +1346,6 @@ index 0000000000..3fe79977e6
 +}
 +
 +/* ================================================================
-+ * Selection helpers
-+ * ================================================================ */
-+
-+static int compute_ideal_state(struct cpuidle_driver *drv, u64 actual_ns)
-+{
-+	int i;
-+
-+	/*
-+	 * Find the deepest state whose threshold (target_residency +
-+	 * exit_latency) is satisfied by the actual sleep duration.
-+	 * Deeper states save more power, so if the CPU slept long enough
-+	 * to justify a deep state, that state was the optimal choice.
-+	 *
-+	 * Iterating from deepest to shallowest returns the first
-+	 * (deepest) qualifying state, giving the NN diverse training
-+	 * labels across all C-states.
-+	 */
-+	for (i = drv->state_count - 1; i > 0; i--) {
-+		struct cpuidle_state *s = &drv->states[i];
-+
-+		if (actual_ns >= s->target_residency_ns + s->exit_latency_ns)
-+			return i;
-+	}
-+	return 0;
-+}
-+
-+/* ================================================================
 + * FPU entry point for nap_select
 + *
 + * Called within kernel_fpu_begin()/kernel_fpu_end().
@@ -1549,8 +1366,6 @@ index 0000000000..3fe79977e6
 +		for (e = 0; e < NAP_NUM_EXPERTS; e++)
 +			nap_init_weights(&d->expert_weights[e]);
 +		nap_init_log2_cost(d, drv);
-+		d->converged = false;
-+		d->ema_accuracy = 0;
 +		d->stats.learn_count = 0;
 +		d->needs_learn = false;
 +		d->reset_pending = false;
@@ -1623,26 +1438,6 @@ index 0000000000..3fe79977e6
 +		}
 +
 +		d->stats.learn_count++;
-+
-+		/* Convergence: compare NN selection with ideal */
-+		if (!d->converged) {
-+			int ideal = compute_ideal_state(drv,
-+							d->learn_actual_ns);
-+			bool hit = (nn_selected == ideal);
-+
-+			d->ema_accuracy += (hit ? 64 : 0)
-+					   - (d->ema_accuracy >> 4);
-+
-+			if (d->stats.learn_count >= d->warmup_threshold &&
-+			    d->ema_accuracy >= d->convergence_thresh) {
-+				d->converged = true;
-+				pr_info("nap: cpu%d converged (ema=%u/%u, learns=%llu)\n",
-+					smp_processor_id(),
-+					d->ema_accuracy,
-+					d->convergence_thresh,
-+					d->stats.learn_count);
-+			}
-+		}
 +
 +		nap_nn_learn(d);
 +		d->needs_learn = false;
