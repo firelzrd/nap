@@ -60,15 +60,11 @@ When the network output is clamped at the upper bound (prediction equals sleep l
 ### Weight Initialization
 
 - Hidden layer: Xavier uniform (deterministic PRNG, seed = 42)
-- Output layer: uniform [-0.005, 0.005]
+- Output layer: uniform [-0.01, 0.01]
 - All biases: zero
 - **Neuron 0 pass-through**: `w_h1[0][0] = 1.0`, `w_out[0] = 1.0`, all other inputs to neuron 0 zeroed
 
 The pass-through initialization ensures the initial output approximates `log2(sleep_length)`, providing sensible state selection before any learning occurs.
-
-### Convergence
-
-An exponential moving average (EMA) of prediction accuracy is tracked. After `warmup_threshold` learning steps (default: 64), the governor checks whether accuracy exceeds `convergence_thresh` (default: 75%). Until convergence, a latency-aware fallback heuristic supplements the network output.
 
 ### SIMD Dispatch
 
@@ -82,20 +78,16 @@ All FPU/SIMD code is compiled into separate translation units and wrapped in `ke
 
 ## Tunables
 
-Exposed under `/sys/devices/system/cpu/cpuidle/nap/`:
+Exposed under `/sys/devices/system/cpu/nap/`:
 
 | Tunable | Default | Description |
 |---|---|---|
 | `version` | *(read-only)* | Governor version |
 | `simd` | *(read-only)* | Detected SIMD capability (`sse2` / `avx2` / `avx512`) |
-| `stats` | *(read-only)* | Total selects, residency, overshoot count/rate, learn count, converged CPUs |
-| `ema_accuracy` | *(read-only)* | Min/avg/max prediction accuracy (x1024 scale) and converged CPUs |
-| `learning_mode` | `online` | Set `online` or `off`; reads back `off` / `online` / `warmup (N/M converged)` |
+| `stats` | *(read-only)* | Total selects, residency, overshoot count/rate, learn count |
 | `learning_rate` | `1` | Learning rate in thousandths (1 = 0.001) |
 | `learn_interval` | `4` | Backpropagation frequency (every N reflects) |
 | `overshoot_pctl` | `50` | Target overshoot percentile in thousandths (50 = 5%) |
-| `warmup_threshold` | `64` | Minimum learning steps before convergence check |
-| `convergence_thresh` | `768` | Accuracy threshold (x1024 scale, 768 = 75%) |
 | `reset_weights` | *(write-only)* | Trigger weight reinitialization (`all` or cpulist e.g. `0-3,5,7`) |
 | `reset_stats` | *(write-only)* | Reset statistics counters |
 
@@ -105,7 +97,7 @@ Nap is delivered as a kernel patch. Apply it to the Linux 6.18.3 source tree and
 
 ```sh
 cd /path/to/linux
-patch -p1 < /path/to/nap/patches/0001-6.18.3-nap-v0.2.0.patch
+patch -p1 < /path/to/nap/patches/0001-6.18.3-nap-v0.2.1.patch
 ```
 
 ### Activate
