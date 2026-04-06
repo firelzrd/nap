@@ -1,0 +1,297 @@
+From b91a67b99d358b9c2e3c45ebda4adc4a23e4e18c Mon Sep 17 00:00:00 2001
+From: Masahito S <firelzrd@gmail.com>
+Date: Mon, 6 Apr 2026 08:47:44 +0900
+Subject: [PATCH] menu/teo overshoot rate sysfs
+
+---
+ drivers/cpuidle/governors/menu.c | 112 +++++++++++++++++++++++++++++--
+ drivers/cpuidle/governors/teo.c  |  97 +++++++++++++++++++++++++-
+ 2 files changed, 203 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/cpuidle/governors/menu.c b/drivers/cpuidle/governors/menu.c
+index ca863ba03d..8a8b8f0092 100644
+--- a/drivers/cpuidle/governors/menu.c
++++ b/drivers/cpuidle/governors/menu.c
+@@ -16,6 +16,9 @@
+ #include <linux/tick.h>
+ #include <linux/sched/stat.h>
+ #include <linux/math64.h>
++#include <linux/sysfs.h>
++#include <linux/kobject.h>
++#include <linux/cpu.h>
+ 
+ #include "gov.h"
+ 
+@@ -76,6 +79,9 @@ struct menu_device {
+ 	unsigned int	correction_factor[BUCKETS];
+ 	unsigned int	intervals[INTERVALS];
+ 	int		interval_ptr;
++	
++	u64		overshoot_count;
++	u64		total_selects;
+ };
+ 
+ static inline int which_bucket(u64 duration_ns)
+@@ -471,7 +477,10 @@ static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+ 	if (measured_ns > data->next_timer_ns)
+ 		measured_ns = data->next_timer_ns;
+ 
+-	/* Update our correction ratio */
++	data->total_selects++;
++	if (target->target_residency_ns > measured_ns)
++		data->overshoot_count++;
++
+ 	new_factor = data->correction_factor[data->bucket];
+ 	new_factor -= new_factor / DECAY;
+ 
+@@ -522,6 +531,89 @@ static int menu_enable_device(struct cpuidle_driver *drv,
+ 	return 0;
+ }
+ 
++static ssize_t menu_show_overshoot_count(struct device *dev,
++					  struct device_attribute *attr, char *buf)
++{
++	int cpu;
++	u64 total = 0, overshoot = 0;
++
++	for_each_online_cpu(cpu) {
++		struct menu_device *data = &per_cpu(menu_devices, cpu);
++		total += data->total_selects;
++		overshoot += data->overshoot_count;
++	}
++
++	return sysfs_emit(buf, "%llu %llu\n", overshoot, total);
++}
++
++static ssize_t menu_show_overshoot_rate(struct device *dev,
++					 struct device_attribute *attr, char *buf)
++{
++	int cpu;
++	u64 total = 0, overshoot = 0;
++	u64 rate_x100 = 0;
++
++	for_each_online_cpu(cpu) {
++		struct menu_device *data = &per_cpu(menu_devices, cpu);
++		total += data->total_selects;
++		overshoot += data->overshoot_count;
++	}
++
++	if (total > 0)
++		rate_x100 = div64_u64(overshoot * 10000, total);
++
++	return sysfs_emit(buf, "%llu %llu %llu.%02llu%%\n",
++			  overshoot, total,
++			  rate_x100 / 100, rate_x100 % 100);
++}
++
++static DEVICE_ATTR(overshoot_count, 0444, menu_show_overshoot_count, NULL);
++static DEVICE_ATTR(overshoot_rate, 0444, menu_show_overshoot_rate, NULL);
++
++static struct attribute *menu_stats_attrs[] = {
++	&dev_attr_overshoot_count.attr,
++	&dev_attr_overshoot_rate.attr,
++	NULL,
++};
++
++static const struct attribute_group menu_stats_group = {
++	.name = "stats",
++	.attrs = menu_stats_attrs,
++};
++
++static struct kobject *menu_kobj;
++
++static int __init menu_sysfs_init(void)
++{
++	struct device *dev_root;
++	int ret;
++
++	dev_root = bus_get_dev_root(&cpu_subsys);
++	if (!dev_root)
++		return -ENODEV;
++
++	menu_kobj = kobject_create_and_add("menu", &dev_root->kobj);
++	put_device(dev_root);
++	if (!menu_kobj)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(menu_kobj, &menu_stats_group);
++	if (ret) {
++		kobject_put(menu_kobj);
++		menu_kobj = NULL;
++	}
++	return ret;
++}
++
++static void __exit menu_sysfs_exit(void)
++{
++	if (menu_kobj) {
++		sysfs_remove_group(menu_kobj, &menu_stats_group);
++		kobject_put(menu_kobj);
++		menu_kobj = NULL;
++	}
++}
++
+ static struct cpuidle_governor menu_governor = {
+ 	.name =		"menu",
+ 	.rating =	20,
+@@ -530,12 +622,22 @@ static struct cpuidle_governor menu_governor = {
+ 	.reflect =	menu_reflect,
+ };
+ 
+-/**
+- * init_menu - initializes the governor
+- */
+ static int __init init_menu(void)
+ {
+-	return cpuidle_register_governor(&menu_governor);
++	int ret;
++
++	ret = menu_sysfs_init();
++	if (ret)
++		pr_warn("menu: sysfs init failed: %d (continuing without sysfs)\n", ret);
++
++	ret = cpuidle_register_governor(&menu_governor);
++	if (ret) {
++		pr_err("menu: register_governor failed: %d\n", ret);
++		menu_sysfs_exit();
++		return ret;
++	}
++
++	return 0;
+ }
+ 
+ postcore_initcall(init_menu);
+diff --git a/drivers/cpuidle/governors/teo.c b/drivers/cpuidle/governors/teo.c
+index 8078eca72c..f3578136e9 100644
+--- a/drivers/cpuidle/governors/teo.c
++++ b/drivers/cpuidle/governors/teo.c
+@@ -102,6 +102,10 @@
+ #include <linux/kernel.h>
+ #include <linux/sched/clock.h>
+ #include <linux/tick.h>
++#include <linux/sysfs.h>
++#include <linux/kobject.h>
++#include <linux/cpu.h>
++#include <linux/math64.h>
+ 
+ #include "gov.h"
+ 
+@@ -144,6 +148,9 @@ struct teo_cpu {
+ 	unsigned int tick_intercepts;
+ 	unsigned int short_idles;
+ 	bool artificial_wakeup;
++	
++	u64 overshoot_count;
++	u64 total_selects;
+ };
+ 
+ static DEFINE_PER_CPU(struct teo_cpu, teo_cpus);
+@@ -225,6 +232,14 @@ static void teo_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+ 
+ 	cpu_data->total -= cpu_data->total >> DECAY_SHIFT;
+ 	cpu_data->total += PULSE;
++
++	/* Count overshoot: selected state's target_residency > actual measured duration */
++	cpu_data->total_selects++;
++	if (dev->last_state_idx >= 0 && dev->last_state_idx < drv->state_count) {
++		u64 selected_target_residency = drv->states[dev->last_state_idx].target_residency_ns;
++		if (selected_target_residency > measured_ns)
++			cpu_data->overshoot_count++;
++	}
+ }
+ 
+ static bool teo_state_ok(int i, struct cpuidle_driver *drv)
+@@ -540,9 +555,89 @@ static struct cpuidle_governor teo_governor = {
+ 	.reflect =	teo_reflect,
+ };
+ 
++static ssize_t teo_show_overshoot_rate(struct device *dev,
++					struct device_attribute *attr, char *buf)
++{
++	int cpu;
++	u64 total = 0, overshoot = 0;
++
++	for_each_online_cpu(cpu) {
++		struct teo_cpu *cpu_data = per_cpu_ptr(&teo_cpus, cpu);
++		total += cpu_data->total_selects;
++		overshoot += cpu_data->overshoot_count;
++	}
++
++	if (total > 0) {
++		u64 rate_x100 = div64_u64(overshoot * 10000, total);
++		return sysfs_emit(buf, "%llu %llu %llu.%02llu%%\n",
++				  overshoot, total,
++				  rate_x100 / 100, rate_x100 % 100);
++	}
++
++	return sysfs_emit(buf, "%llu %llu 0.00%%\n", overshoot, total);
++}
++
++static DEVICE_ATTR(overshoot_rate, 0444, teo_show_overshoot_rate, NULL);
++
++static struct attribute *teo_stats_attrs[] = {
++	&dev_attr_overshoot_rate.attr,
++	NULL,
++};
++
++static const struct attribute_group teo_stats_group = {
++	.name = "stats",
++	.attrs = teo_stats_attrs,
++};
++
++static struct kobject *teo_kobj;
++
++static int __init teo_sysfs_init(void)
++{
++	struct device *dev_root;
++	int ret;
++
++	dev_root = bus_get_dev_root(&cpu_subsys);
++	if (!dev_root)
++		return -ENODEV;
++
++	teo_kobj = kobject_create_and_add("teo", &dev_root->kobj);
++	put_device(dev_root);
++	if (!teo_kobj)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(teo_kobj, &teo_stats_group);
++	if (ret) {
++		kobject_put(teo_kobj);
++		teo_kobj = NULL;
++	}
++	return ret;
++}
++
++static void __exit teo_sysfs_exit(void)
++{
++	if (teo_kobj) {
++		sysfs_remove_group(teo_kobj, &teo_stats_group);
++		kobject_put(teo_kobj);
++		teo_kobj = NULL;
++	}
++}
++
+ static int __init teo_governor_init(void)
+ {
+-	return cpuidle_register_governor(&teo_governor);
++	int ret;
++
++	ret = teo_sysfs_init();
++	if (ret)
++		pr_warn("teo: sysfs init failed: %d (continuing without sysfs)\n", ret);
++
++	ret = cpuidle_register_governor(&teo_governor);
++	if (ret) {
++		pr_err("teo: register_governor failed: %d\n", ret);
++		teo_sysfs_exit();
++		return ret;
++	}
++
++	return 0;
+ }
+ 
+ postcore_initcall(teo_governor_init);
+-- 
+2.34.1
+

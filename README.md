@@ -91,6 +91,26 @@ Exposed under `/sys/devices/system/cpu/nap/`:
 | `reset_weights` | *(write-only)* | Trigger weight reinitialization (`all` or cpulist e.g. `0-3,5,7`) |
 | `reset_stats` | *(write-only)* | Reset statistics counters |
 
+## Benchmark: Overshoot Rate
+
+Overshoot rate measures how often a governor selects a C-state deeper than the actual residency justifies. Lower is better.
+
+| Governor | Overshoot Rate |
+|----------|---------------|
+| **nap**  | 4.2%         |
+| teo      | 19.70%     |
+| menu     | 47.27%       |
+
+Measured with [this patch](https://github.com/firelzrd/nap/blob/main/tests/0002-menu-teo-overshoot-rate-sysfs.patch) applied on moderately idle desktop (10-second sample per governor, Linux 6.18, AMD Zen):
+
+```sh
+for gov in menu teo nap; do
+  echo $gov | sudo tee /sys/devices/system/cpu/cpuidle/current_governor
+  sleep 10
+  grep -R . /sys/devices/system/cpu/$gov/stats
+done
+```
+
 ## Installation
 
 Nap is delivered as a kernel patch. Apply it to the Linux 6.18.3 source tree and enable `CONFIG_CPU_IDLE_GOV_NAP=y`:
