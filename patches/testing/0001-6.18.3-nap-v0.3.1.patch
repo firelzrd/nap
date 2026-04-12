@@ -1,7 +1,7 @@
-From 8c8e6d7903cb6ee0887091752aaf82d289cabe33 Mon Sep 17 00:00:00 2001
+From e2dc1653fa15a10d8f0ca9f835c6de21a8775c26 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 10 Apr 2026 13:10:26 +0900
-Subject: [PATCH] 6.18.3-nap-v0.3.0
+Date: Sun, 12 Apr 2026 12:44:54 +0900
+Subject: [PATCH] 6.18.3-nap-v0.3.1
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
@@ -9,11 +9,11 @@ Subject: [PATCH] 6.18.3-nap-v0.3.0
  drivers/cpuidle/governors/nap/Makefile        |  33 +
  drivers/cpuidle/governors/nap/nap.c           | 717 ++++++++++++++++++
  drivers/cpuidle/governors/nap/nap.h           | 302 ++++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 621 +++++++++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c       | 623 +++++++++++++++
  drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 207 +++++
  drivers/cpuidle/governors/nap/nap_nn_avx512.c | 203 +++++
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 154 ++++
- 9 files changed, 2255 insertions(+)
+ 9 files changed, 2257 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -100,7 +100,7 @@ index 0000000000..bb983497a4
 +			   -Wframe-larger-than=4096
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..07d99491d0
+index 0000000000..314e7ed479
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
 @@ -0,0 +1,717 @@
@@ -147,13 +147,13 @@ index 0000000000..07d99491d0
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.3.0"
++#define CPUIDLE_NAP_VERSION  "0.3.1"
 +
 +/* Governor defaults */
 +#define NAP_DEFAULT_LR_MILLTHS    1     /* 0.001 = 1 millths */
 +#define NAP_DEFAULT_INTERVAL      4     /* learn every 4 reflects */
 +#define NAP_DEFAULT_CLAMP_MILLTHS 1000  /* 1.0 = 1000 millths */
-+#define NAP_DEFAULT_PCTL_MILLTHS  50    /* 5th percentile (conservative) */
++#define NAP_DEFAULT_PCTL_MILLTHS  80    /* 8th percentile */
 +
 +/* ================================================================
 + * ISA dispatch via static keys (definitions only; dispatch in nap_fpu.c)
@@ -513,7 +513,7 @@ index 0000000000..07d99491d0
 +}
 +
 +/* ================================================================
-+ * sysfs interface  (/sys/devices/system/cpu/cpuidle/nap/)
++ * sysfs interface  (/sys/devices/system/cpu/nap/)
 + * ================================================================ */
 +
 +static ssize_t stats_show(struct kobject *kobj,
@@ -823,7 +823,7 @@ index 0000000000..07d99491d0
 +postcore_initcall(nap_init);
 diff --git a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
 new file mode 100644
-index 0000000000..9862ebe0d9
+index 0000000000..5b17f8219f
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.h
 @@ -0,0 +1,302 @@
@@ -1089,8 +1089,8 @@ index 0000000000..9862ebe0d9
 +	float learn_lr;		/* effective lr (base_lr * asymmetric weight) */
 +	float learn_d_hid[NAP_HIDDEN_SIZE] __aligned(64);
 +
-+	/* Precomputed per-state log2(cost) for threshold selection.
-+	 * log2_cost[i] = log2(target_residency_ns + exit_latency_ns).
++	/* Precomputed per-state log2(target_residency) for threshold selection.
++	 * log2_cost[i] = log2(target_residency_ns).
 +	 */
 +	float log2_cost[CPUIDLE_STATE_MAX];
 +
@@ -1131,10 +1131,10 @@ index 0000000000..9862ebe0d9
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000..cff1a4368b
+index 0000000000..60dc1b55b1
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,623 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1294,11 +1294,14 @@ index 0000000000..cff1a4368b
 +}
 +
 +/*
-+ * Precompute log2(cost) per state for threshold-based selection.
-+ * cost = target_residency_ns + exit_latency_ns.
++ * Precompute log2(target_residency) per state for threshold-based selection.
 + *
 + * Used in the selection loop: pick deepest state where
 + * log2_cost[i] <= nn_output (predicted sleep time in log2 space).
++ *
++ * Only target_residency_ns is used — exit_latency is a wakeup cost,
++ * not a factor in whether the CPU can profitably stay in the state
++ * for the predicted duration.
 + */
 +static void nap_init_log2_cost(struct nap_cpu_data *d,
 +			       struct cpuidle_driver *drv)
@@ -1308,28 +1311,26 @@ index 0000000000..cff1a4368b
 +	int i;
 +
 +	for (i = 0; i < drv->state_count; i++) {
-+		float cost = float_max(
-+			(float)(drv->states[i].target_residency_ns +
-+				drv->states[i].exit_latency_ns), 1.0f);
-+		d->log2_cost[i] = fast_log2f(cost);
++		float res = float_max(
++			(float)drv->states[i].target_residency_ns, 1.0f);
++		d->log2_cost[i] = fast_log2f(res);
 +	}
 +
 +	/*
 +	 * MoE expert boundary — jiffy-based split.
 +	 *
-+	 * The kernel's natural sleep-duration boundary is one tick:
-+	 * idles shorter than a jiffy are tick-bound (the scheduler
-+	 * tick will fire within the idle period); idles longer than
-+	 * a jiffy enter nohz territory where the tick is stopped.
-+	 * This is the physically meaningful boundary between "short
-+	 * sleep" and "long sleep" from the scheduler's perspective.
++	 * The tick period is the natural boundary between "short"
++	 * (tick-bound) and "long" (nohz) idle durations.  When the
++	 * tick is running, measured residency is dominated by the
++	 * next tick rather than the workload's true idle duration,
++	 * producing noisy gradients that would contaminate the long
++	 * expert's model if both regimes shared weights.  Tying the
++	 * split to TICK_NSEC ensures the boundary tracks the actual
++	 * tick/nohz transition regardless of HZ configuration.
 +	 *
-+	 * Assign the long expert to all C-states whose cost exceeds
-+	 * one jiffy; the short expert covers the rest.  Safety
-+	 * fallback: if no state would naturally exceed the jiffy
-+	 * (exotic HW, or HZ=100 with very shallow C-states), pin the
-+	 * deepest state to the long expert so the mixture remains
-+	 * non-trivial.
++	 * Safety fallback: the deepest state is always assigned to
++	 * the long expert so the mixture remains non-trivial even
++	 * on hardware where all states have short residencies.
 +	 */
 +	if (drv->state_count <= 1) {
 +		d->expert_mid = 0.0f;
@@ -1341,7 +1342,7 @@ index 0000000000..cff1a4368b
 +	/* Default: deepest state belongs to long expert (safety) */
 +	long_start = drv->state_count - 1;
 +
-+	/* Prefer the first state whose cost actually exceeds a jiffy */
++	/* Prefer the first state whose target_residency exceeds one jiffy */
 +	for (i = 1; i < drv->state_count; i++) {
 +		if (d->log2_cost[i] > log2_tick) {
 +			long_start = i;
@@ -1357,8 +1358,9 @@ index 0000000000..cff1a4368b
 +		/*
 +		 * long_start == 1: even the shallowest C-state already
 +		 * exceeds one jiffy.  All NN-handled idles go to the
-+		 * long expert; place the boundary just below C1's cost
-+		 * so the short expert remains routable but unused.
++		 * long expert; place the boundary just below C1's
++		 * residency so the short expert remains routable but
++		 * unused.
 +		 */
 +		d->expert_mid = d->log2_cost[1] - 1.0f;
 +	}
