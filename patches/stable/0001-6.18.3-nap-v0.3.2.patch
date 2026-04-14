@@ -1,7 +1,7 @@
-From e2dc1653fa15a10d8f0ca9f835c6de21a8775c26 Mon Sep 17 00:00:00 2001
+From abdb31a0f7910f54bac9a8938afce59d841dabe7 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 12 Apr 2026 12:44:54 +0900
-Subject: [PATCH] 6.18.3-nap-v0.3.1
+Date: Wed, 15 Apr 2026 08:36:30 +0900
+Subject: [PATCH] 6.18.3-nap-v0.3.2
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
@@ -9,11 +9,11 @@ Subject: [PATCH] 6.18.3-nap-v0.3.1
  drivers/cpuidle/governors/nap/Makefile        |  33 +
  drivers/cpuidle/governors/nap/nap.c           | 717 ++++++++++++++++++
  drivers/cpuidle/governors/nap/nap.h           | 302 ++++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 623 +++++++++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c       | 635 ++++++++++++++++
  drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 207 +++++
  drivers/cpuidle/governors/nap/nap_nn_avx512.c | 203 +++++
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 154 ++++
- 9 files changed, 2257 insertions(+)
+ 9 files changed, 2269 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -100,7 +100,7 @@ index 0000000000..bb983497a4
 +			   -Wframe-larger-than=4096
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..314e7ed479
+index 0000000000..e3ac2a9e10
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
 @@ -0,0 +1,717 @@
@@ -147,7 +147,7 @@ index 0000000000..314e7ed479
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.3.1"
++#define CPUIDLE_NAP_VERSION  "0.3.2"
 +
 +/* Governor defaults */
 +#define NAP_DEFAULT_LR_MILLTHS    1     /* 0.001 = 1 millths */
@@ -1131,10 +1131,10 @@ index 0000000000..5b17f8219f
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000..60dc1b55b1
+index 0000000000..59ced03672
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,635 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1152,6 +1152,7 @@ index 0000000000..60dc1b55b1
 +#include <linux/kernel_stat.h>
 +#include <linux/math64.h>
 +#include <linux/percpu.h>
++#include <linux/pm_qos.h>
 +#include <linux/sched/clock.h>
 +#include <linux/sched/stat.h>
 +#include <linux/string.h>
@@ -1587,24 +1588,35 @@ index 0000000000..60dc1b55b1
 +		dens[2] = (d->intercept_window > 0)
 +			? (float)d->intercept_window : 1.0f;
 +
-+		/* out[14]: latency_req / deepest_lat */
++		/* out[14]: log2(latency_req) - log2(deepest_lat)
++		 *
++		 * Log2-space difference keeps the feature in the same
++		 * scale as other log2-based inputs (features 0-5, 11, 15).
++		 * When unconstrained (PM_QOS_LATENCY_ANY_NS), output 0
++		 * so the feature is neutral.
++		 */
 +		{
 +			u64 deepest_lat =
 +				drv->states[drv->state_count - 1]
 +				    .exit_latency_ns;
 +
-+			lat_valid = (latency_req < S64_MAX &&
-+				     deepest_lat > 0);
-+			nums[3] = lat_valid ? (float)latency_req : 1.0f;
-+			dens[3] = lat_valid ? (float)deepest_lat : 1.0f;
++			if (latency_req < PM_QOS_LATENCY_ANY_NS &&
++			    deepest_lat > 0)
++				out[14] = fast_log2f((float)latency_req)
++					- fast_log2f((float)deepest_lat);
++			else
++				out[14] = 0.0f;
 +		}
++
++		/* Slot [3] unused — fill with 1/1 nop for SIMD lane */
++		nums[3] = 1.0f;
++		dens[3] = 1.0f;
 +
 +		ratios = *(const v4sf *)nums
 +			 * __builtin_ia32_rcpps(*(const v4sf *)dens);
 +		out[7]  = ratios[0];
 +		out[8]  = ratios[1];
 +		out[9]  = ratios[2];
-+		out[14] = ratios[3];
 +	}
 +
 +	d->last_predicted_ns = ktime_to_ns(sleep_length);
