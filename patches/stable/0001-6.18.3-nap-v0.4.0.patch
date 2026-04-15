@@ -1,25 +1,23 @@
-From abdb31a0f7910f54bac9a8938afce59d841dabe7 Mon Sep 17 00:00:00 2001
+From 1d2e8272f288fecce3fd7f762fb8c628ed04b7fe Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 15 Apr 2026 08:36:30 +0900
-Subject: [PATCH] 6.18.3-nap-v0.3.2
+Date: Wed, 15 Apr 2026 08:37:01 +0900
+Subject: [PATCH] 6.18.3-nap-v0.4.0
 
 ---
- drivers/cpuidle/Kconfig                       |  17 +
- drivers/cpuidle/governors/Makefile            |   1 +
- drivers/cpuidle/governors/nap/Makefile        |  33 +
- drivers/cpuidle/governors/nap/nap.c           | 717 ++++++++++++++++++
- drivers/cpuidle/governors/nap/nap.h           | 302 ++++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 635 ++++++++++++++++
- drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 207 +++++
- drivers/cpuidle/governors/nap/nap_nn_avx512.c | 203 +++++
- drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 154 ++++
- 9 files changed, 2269 insertions(+)
+ drivers/cpuidle/Kconfig                     |  17 +
+ drivers/cpuidle/governors/Makefile          |   1 +
+ drivers/cpuidle/governors/nap/Makefile      |  29 +
+ drivers/cpuidle/governors/nap/nap.c         | 669 ++++++++++++++++++++
+ drivers/cpuidle/governors/nap/nap.h         | 283 +++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c     | 572 +++++++++++++++++
+ drivers/cpuidle/governors/nap/nap_nn_avx2.c | 135 ++++
+ drivers/cpuidle/governors/nap/nap_nn_sse2.c | 136 ++++
+ 8 files changed, 1842 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
  create mode 100644 drivers/cpuidle/governors/nap/nap_fpu.c
  create mode 100644 drivers/cpuidle/governors/nap/nap_nn_avx2.c
- create mode 100644 drivers/cpuidle/governors/nap/nap_nn_avx512.c
  create mode 100644 drivers/cpuidle/governors/nap/nap_nn_sse2.c
 
 diff --git a/drivers/cpuidle/Kconfig b/drivers/cpuidle/Kconfig
@@ -61,10 +59,10 @@ index 63abb5393a..ae688891c0 100644
 +obj-$(CONFIG_CPU_IDLE_GOV_NAP) += nap/
 diff --git a/drivers/cpuidle/governors/nap/Makefile b/drivers/cpuidle/governors/nap/Makefile
 new file mode 100644
-index 0000000000..bb983497a4
+index 0000000000..6d48cd5384
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/Makefile
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,29 @@
 +# SPDX-License-Identifier: GPL-2.0-only
 +#
 +# Makefile for the NAP cpuidle governor
@@ -72,7 +70,7 @@ index 0000000000..bb983497a4
 +
 +obj-$(CONFIG_CPU_IDLE_GOV_NAP) += cpuidle_gov_nap.o
 +
-+cpuidle_gov_nap-y := nap.o nap_fpu.o nap_nn_sse2.o nap_nn_avx2.o nap_nn_avx512.o
++cpuidle_gov_nap-y := nap.o nap_fpu.o nap_nn_sse2.o nap_nn_avx2.o
 +
 +# Kernel builds with -mno-sse -mno-sse2 -mno-avx -msoft-float -mno-80387
 +# -mno-fp-ret-in-387.  FPU/SIMD-using files need these removed and ISA
@@ -91,31 +89,28 @@ index 0000000000..bb983497a4
 +CFLAGS_REMOVE_nap_fpu.o        += $(FPU_KILL_FLAGS)
 +CFLAGS_REMOVE_nap_nn_sse2.o    += $(FPU_KILL_FLAGS)
 +CFLAGS_REMOVE_nap_nn_avx2.o    += $(FPU_KILL_FLAGS)
-+CFLAGS_REMOVE_nap_nn_avx512.o  += $(FPU_KILL_FLAGS)
-+
 +CFLAGS_nap_fpu.o       += $(CC_FLAGS_FPU)
 +CFLAGS_nap_nn_sse2.o   += $(CC_FLAGS_FPU)
 +CFLAGS_nap_nn_avx2.o   += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma
-+CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma -mavx512f \
-+			   -Wframe-larger-than=4096
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..e3ac2a9e10
+index 0000000000..a88de5591a
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
-@@ -0,0 +1,717 @@
+@@ -0,0 +1,669 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap.c — Neural Adaptive Predictor cpuidle governor
 + *
-+ * A machine-learning-based cpuidle governor that uses a small MLP (16→16→1)
-+ * to predict a log2 correction factor for sleep_length.  State selection is
-+ * deterministic threshold comparison.  Weights are Xavier-initialized at boot,
-+ * then refined via online learning (deferred backpropagation with SGD).
++ * A machine-learning-based cpuidle governor that uses a small MLP (8→8→1)
++ * with 3 Mixture-of-Experts (short/long/deep) to predict a log2 correction
++ * factor for sleep_length.  State selection is deterministic threshold
++ * comparison.  Weights are Xavier-initialized at boot, then refined via
++ * online learning (deferred backpropagation with SGD).
 + *
 + * IMPORTANT: This file is compiled WITHOUT FPU/SSE flags (normal kernel
 + * compilation).  All floating-point and SIMD code lives in nap_fpu.c and
-+ * nap_nn_{sse2,avx2,avx512}.c, which are compiled with CC_FLAGS_FPU.
++ * nap_nn_{sse2,avx2}.c, which are compiled with CC_FLAGS_FPU.
 + * This separation ensures the compiler cannot emit SSE instructions in
 + * governor callbacks (nap_select, nap_reflect, etc.), which would corrupt
 + * userspace FPU register state.
@@ -124,7 +119,6 @@ index 0000000000..e3ac2a9e10
 +#include <linux/cpuidle.h>
 +#include <linux/cpu.h>
 +#include <linux/jump_label.h>
-+#include <linux/kernel_stat.h>
 +#include <linux/kobject.h>
 +#include <linux/math64.h>
 +#include <linux/percpu.h>
@@ -147,44 +141,26 @@ index 0000000000..e3ac2a9e10
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.3.2"
++#define CPUIDLE_NAP_VERSION  "0.4.0"
 +
 +/* Governor defaults */
 +#define NAP_DEFAULT_LR_MILLTHS    1     /* 0.001 = 1 millths */
 +#define NAP_DEFAULT_INTERVAL      4     /* learn every 4 reflects */
 +#define NAP_DEFAULT_CLAMP_MILLTHS 1000  /* 1.0 = 1000 millths */
-+#define NAP_DEFAULT_PCTL_MILLTHS  80    /* 8th percentile */
++#define NAP_DEFAULT_PCTL_MILLTHS  100   /* 10th percentile */
 +
 +/* ================================================================
 + * ISA dispatch via static keys (definitions only; dispatch in nap_fpu.c)
 + * ================================================================ */
 +
-+DEFINE_STATIC_KEY_FALSE(nap_use_avx512);
 +DEFINE_STATIC_KEY_FALSE(nap_use_avx2);
 +
-+/*
-+ * Intel CPUs (Skylake through Sapphire Rapids) reduce core frequency
-+ * when executing 512-bit AVX instructions ("AVX-512 heavy" license).
-+ * Recovery takes ~670 µs, so using AVX-512 right before entering idle
-+ * can hurt wakeup latency on shallow C-states (C1).
-+ *
-+ * The cycle savings from AVX-512 over AVX2 are small (~2-4 ns after
-+ * accumulator splitting), far outweighed by the frequency penalty.
-+ * AMD Zen 4+ does not throttle on AVX-512, so we enable it there.
-+ */
 +static void __init nap_detect_simd(void)
 +{
-+	if (boot_cpu_has(X86_FEATURE_AVX512F) &&
-+	    boot_cpu_data.x86_vendor != X86_VENDOR_INTEL) {
-+		static_branch_enable(&nap_use_avx512);
-+		pr_info("nap: using AVX-512F (no frequency penalty)\n");
-+	} else if (boot_cpu_has(X86_FEATURE_FMA) &&
-+		   boot_cpu_has(X86_FEATURE_AVX2)) {
++	if (boot_cpu_has(X86_FEATURE_FMA) &&
++	    boot_cpu_has(X86_FEATURE_AVX2)) {
 +		static_branch_enable(&nap_use_avx2);
-+		if (boot_cpu_has(X86_FEATURE_AVX512F))
-+			pr_info("nap: using AVX2+FMA (AVX-512 avoided for frequency stability)\n");
-+		else
-+			pr_info("nap: using AVX2+FMA\n");
++		pr_info("nap: using AVX2+FMA\n");
 +	} else {
 +		pr_info("nap: using SSE2\n");
 +	}
@@ -208,37 +184,10 @@ index 0000000000..e3ac2a9e10
 +	if (d->hist_count < NAP_HISTORY_SIZE)
 +		d->hist_count++;
 +
-+	d->total_count++;
-+	if (measured_ns < NAP_SHORT_THRESH_NS)
-+		d->short_count++;
 +}
 +
-+static void nap_update_hit_intercept(struct nap_cpu_data *d,
-+				     struct cpuidle_driver *drv,
-+				     struct cpuidle_device *dev,
-+				     int selected_idx, u64 measured_ns)
++static void nap_update_external_signals(struct nap_cpu_data *d)
 +{
-+	d->total_usage++;
-+
-+	if (selected_idx + 1 < drv->state_count &&
-+	    measured_ns > drv->states[selected_idx + 1].target_residency_ns)
-+		d->total_above++;
-+
-+	d->intercept_window++;
-+	if (measured_ns < (u64)d->last_predicted_ns)
-+		d->intercept_recent++;
-+
-+	if (d->intercept_window >= 1024) {
-+		d->intercept_window >>= 1;
-+		d->intercept_recent >>= 1;
-+	}
-+}
-+
-+static void nap_update_external_signals(struct nap_cpu_data *d, int cpu)
-+{
-+	u64 cur_irq = kstat_cpu_irqs_sum(cpu);
-+
-+	d->prev_irq_count = cur_irq;
 +	d->prev_idle_exit = local_clock();
 +}
 +
@@ -442,10 +391,9 @@ index 0000000000..e3ac2a9e10
 +	}
 +
 +	nap_history_update(d, measured_ns);
-+	nap_update_hit_intercept(d, drv, dev, index, measured_ns);
 +
 +	d->last_prediction_error = d->last_predicted_ns - (s64)measured_ns;
-+	nap_update_external_signals(d, dev->cpu);
++	nap_update_external_signals(d);
 +
 +	/*
 +	 * Dual gate: learn when both the per-N-reflect counter fires
@@ -717,9 +665,7 @@ index 0000000000..e3ac2a9e10
 +static ssize_t simd_show(struct kobject *kobj,
 +			 struct kobj_attribute *attr, char *buf)
 +{
-+	if (static_branch_unlikely(&nap_use_avx512))
-+		return sysfs_emit(buf, "avx512\n");
-+	else if (static_branch_unlikely(&nap_use_avx2))
++	if (static_branch_unlikely(&nap_use_avx2))
 +		return sysfs_emit(buf, "avx2\n");
 +	else
 +		return sysfs_emit(buf, "sse2\n");
@@ -823,10 +769,10 @@ index 0000000000..e3ac2a9e10
 +postcore_initcall(nap_init);
 diff --git a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
 new file mode 100644
-index 0000000000..5b17f8219f
+index 0000000000..1059db983b
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.h
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,283 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef NAP_H
 +#define NAP_H
@@ -839,12 +785,12 @@ index 0000000000..5b17f8219f
 + * Neural network dimensions
 + * ================================================================ */
 +
-+#define NAP_INPUT_SIZE    16
-+#define NAP_HIDDEN_SIZE   16
-+#define NAP_NUM_EXPERTS   2
++#define NAP_INPUT_SIZE    8
++#define NAP_HIDDEN_SIZE   8
++#define NAP_NUM_EXPERTS   3
 +
 +/*
-+ * Neural network weight structure for a 16→16→1 MLP (scalar regression).
++ * Neural network weight structure for an 8→8→1 MLP (scalar regression).
 + *
 + * The NN outputs a single log2 correction factor applied to sleep_length:
 + *   effective_sleep = exp2(log2(sleep_length) + nn_output)
@@ -855,34 +801,29 @@ index 0000000000..5b17f8219f
 + * This layout enables efficient column-wise matrix-vector products where
 + * each input broadcasts across all hidden neurons via SIMD FMA.
 + *
-+ * __aligned(64) ensures AVX2 (vmovaps, 32-byte) and AVX-512
-+ * (vmovaps, 64-byte) aligned loads work correctly.
++ * __aligned(32) ensures AVX2 vmovaps (32-byte aligned) loads work
++ * correctly.  8 floats = 32 bytes = one ymm register.
 + */
 +struct nap_weights {
-+	/* Hidden layer: input[16] → hidden[16] */
-+	float w_h1[NAP_INPUT_SIZE][NAP_HIDDEN_SIZE];  /* 256 params */
-+	float b_h1[NAP_HIDDEN_SIZE];                   /* 16 params  */
-+	/* Output layer: hidden[16] → 1 scalar */
-+	float w_out[NAP_HIDDEN_SIZE];                  /* 16 params  */
-+	float b_out;                                   /* 1 param    */
-+} __aligned(64);
++	/* Hidden layer: input[8] → hidden[8] */
++	float w_h1[NAP_INPUT_SIZE][NAP_HIDDEN_SIZE];  /* 64 params */
++	float b_h1[NAP_HIDDEN_SIZE];                   /* 8 params  */
++	/* Output layer: hidden[8] → 1 scalar */
++	float w_out[NAP_HIDDEN_SIZE];                  /* 8 params  */
++	float b_out;                                   /* 1 param   */
++} __aligned(32);
 +
 +/* ISA-specific forward pass implementations */
 +void nap_nn_forward_sse2(const float *input, float *output,
 +			 float *hidden_save, const struct nap_weights *w);
 +void nap_nn_forward_avx2(const float *input, float *output,
 +			 float *hidden_save, const struct nap_weights *w);
-+void nap_nn_forward_avx512(const float *input, float *output,
-+			   float *hidden_save, const struct nap_weights *w);
-+
 +/* ISA-specific online learning (backpropagation) */
 +struct nap_cpu_data;
 +void nap_nn_learn_sse2(struct nap_cpu_data *d);
 +void nap_nn_learn_avx2(struct nap_cpu_data *d);
-+void nap_nn_learn_avx512(struct nap_cpu_data *d);
 +
-+/* Static keys for ISA dispatch (defined in nap.c) */
-+DECLARE_STATIC_KEY_FALSE(nap_use_avx512);
++/* Static key for ISA dispatch (defined in nap.c) */
 +DECLARE_STATIC_KEY_FALSE(nap_use_avx2);
 +
 +/* ================================================================
@@ -901,15 +842,12 @@ index 0000000000..5b17f8219f
 +typedef float v4sf  __attribute__((__vector_size__(16)));   /* xmm: 4×float  */
 +typedef int   v4si  __attribute__((__vector_size__(16)));   /* xmm: 4×int32  */
 +typedef float v8sf  __attribute__((__vector_size__(32)));   /* ymm: 8×float  */
-+typedef float v16sf __attribute__((__vector_size__(64)));   /* zmm: 16×float */
 +
 +/* Broadcast helpers */
 +#define V4SF_SET1(x)  ((v4sf){ (x), (x), (x), (x) })
 +#define V4SI_SET1(x)  ((v4si){ (x), (x), (x), (x) })
 +#define V8SF_SET1(x)  ((v8sf){ (x),(x),(x),(x),(x),(x),(x),(x) })
 +#define V8SF_ZERO     V8SF_SET1(0.0f)
-+#define V16SF_SET1(x) ((v16sf){ (x),(x),(x),(x),(x),(x),(x),(x), \
-+                                (x),(x),(x),(x),(x),(x),(x),(x) })
 +
 +/* Unaligned load/store helpers */
 +static inline v4sf v4sf_loadu(const float *p)
@@ -1001,8 +939,6 @@ index 0000000000..5b17f8219f
 + * ================================================================ */
 +
 +#define NAP_HISTORY_SIZE     8
-+#define NAP_NUM_FEATURES     16
-+#define NAP_SHORT_THRESH_NS  (100 * NSEC_PER_USEC)
 +
 +/* ================================================================
 + * POLL short-circuit tunables
@@ -1039,16 +975,7 @@ index 0000000000..5b17f8219f
 +	int   hist_idx;
 +	int   hist_count;
 +
-+	/* Statistics tracking */
-+	u64   total_above;
-+	u64   total_usage;
-+	u64   intercept_recent;
-+	u64   intercept_window;
-+	u64   short_count;
-+	u64   total_count;
-+
 +	/* External signal tracking */
-+	u64     prev_irq_count;
 +	u64     prev_idle_exit;
 +	s64     last_predicted_ns;
 +	s64     last_prediction_error;
@@ -1073,21 +1000,20 @@ index 0000000000..5b17f8219f
 +
 +	/*
 +	 * hidden_out[], features_f32[] are written with aligned SIMD
-+	 * stores in nap_nn_forward_{sse2,avx2,avx512}() and
++	 * stores in nap_nn_forward_{sse2,avx2}() and
 +	 * nap_extract_features():
 +	 *   SSE2:    movaps  (16-byte aligned)
 +	 *   AVX2:    vmovaps (32-byte aligned)
-+	 *   AVX-512: vmovaps zmm (64-byte aligned)
 +	 * Without __aligned(64), the natural struct offset would be
 +	 * only 4-byte aligned, causing #GP faults in the idle task.
 +	 */
-+	float hidden_out[NAP_HIDDEN_SIZE] __aligned(64);
-+	float features_f32[NAP_NUM_FEATURES] __aligned(64);
++	float hidden_out[NAP_HIDDEN_SIZE] __aligned(32);
++	float features_f32[NAP_INPUT_SIZE] __aligned(32);
 +
 +	/* Backprop scratch */
 +	float learn_d_out;	/* output gradient direction (±1) */
 +	float learn_lr;		/* effective lr (base_lr * asymmetric weight) */
-+	float learn_d_hid[NAP_HIDDEN_SIZE] __aligned(64);
++	float learn_d_hid[NAP_HIDDEN_SIZE] __aligned(32);
 +
 +	/* Precomputed per-state log2(target_residency) for threshold selection.
 +	 * log2_cost[i] = log2(target_residency_ns).
@@ -1099,11 +1025,12 @@ index 0000000000..5b17f8219f
 +	bool  output_clamped;	/* true if nn_output was clamped to features[0] */
 +	u64   learn_actual_ns;
 +
-+	/* Mixture-of-Experts: 2 experts × 16 neurons each */
++	/* Mixture-of-Experts: 3 experts × 8 neurons each */
 +	struct nap_weights expert_weights[NAP_NUM_EXPERTS];
 +	struct nap_weights *active_w;	/* selected expert for current/deferred pass */
-+	int   active_expert;		/* 0 or 1: which expert is active */
-+	float expert_mid;		/* log2 threshold for expert selection */
++	int   active_expert;		/* 0, 1, or 2: which expert is active */
++	float expert_mid;		/* log2 threshold: short ↔ long */
++	float expert_deep;		/* log2 threshold: long ↔ deep */
 +
 +	/* Online learning */
 +	unsigned int learning_rate_millths;
@@ -1131,10 +1058,10 @@ index 0000000000..5b17f8219f
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000..59ced03672
+index 0000000000..482a06a5d0
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,572 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1149,12 +1076,10 @@ index 0000000000..59ced03672
 + */
 +
 +#include <linux/cpuidle.h>
-+#include <linux/kernel_stat.h>
 +#include <linux/math64.h>
 +#include <linux/percpu.h>
 +#include <linux/pm_qos.h>
 +#include <linux/sched/clock.h>
-+#include <linux/sched/stat.h>
 +#include <linux/string.h>
 +#include <linux/tick.h>
 +
@@ -1222,9 +1147,7 @@ index 0000000000..59ced03672
 +				  float *hidden_save,
 +				  const struct nap_weights *w)
 +{
-+	if (static_branch_unlikely(&nap_use_avx512))
-+		nap_nn_forward_avx512(input, output, hidden_save, w);
-+	else if (static_branch_unlikely(&nap_use_avx2))
++	if (static_branch_unlikely(&nap_use_avx2))
 +		nap_nn_forward_avx2(input, output, hidden_save, w);
 +	else
 +		nap_nn_forward_sse2(input, output, hidden_save, w);
@@ -1232,9 +1155,7 @@ index 0000000000..59ced03672
 +
 +static inline void nap_nn_learn(struct nap_cpu_data *d)
 +{
-+	if (static_branch_unlikely(&nap_use_avx512))
-+		nap_nn_learn_avx512(d);
-+	else if (static_branch_unlikely(&nap_use_avx2))
++	if (static_branch_unlikely(&nap_use_avx2))
 +		nap_nn_learn_avx2(d);
 +	else
 +		nap_nn_learn_sse2(d);
@@ -1308,7 +1229,7 @@ index 0000000000..59ced03672
 +			       struct cpuidle_driver *drv)
 +{
 +	float log2_tick;
-+	int long_start;
++	int long_start, deep_idx;
 +	int i;
 +
 +	for (i = 0; i < drv->state_count; i++) {
@@ -1318,23 +1239,28 @@ index 0000000000..59ced03672
 +	}
 +
 +	/*
-+	 * MoE expert boundary — jiffy-based split.
++	 * MoE expert boundaries — 3-way split.
 +	 *
-+	 * The tick period is the natural boundary between "short"
-+	 * (tick-bound) and "long" (nohz) idle durations.  When the
-+	 * tick is running, measured residency is dominated by the
-+	 * next tick rather than the workload's true idle duration,
-+	 * producing noisy gradients that would contaminate the long
-+	 * expert's model if both regimes shared weights.  Tying the
-+	 * split to TICK_NSEC ensures the boundary tracks the actual
-+	 * tick/nohz transition regardless of HZ configuration.
++	 * Expert 0 (short): tick-bound idles where measured residency
++	 *   is dominated by the next tick rather than the workload's
++	 *   true idle duration.  Boundary: log2(TICK_NSEC).
 +	 *
-+	 * Safety fallback: the deepest state is always assigned to
-+	 * the long expert so the mixture remains non-trivial even
-+	 * on hardware where all states have short residencies.
++	 * Expert 1 (long): nohz idles in intermediate C-states.
++	 *
++	 * Expert 2 (deep): idles targeting the deepest C-state.
++	 *   The deepest state often has qualitatively different
++	 *   residency characteristics (package C-state, longer
++	 *   exit latency, power-gated domains) that warrant a
++	 *   dedicated expert to avoid gradient interference with
++	 *   intermediate states.
++	 *
++	 * Safety: with only 2 C-states (+ POLL), expert_deep is
++	 * placed equal to expert_mid so the deep expert is never
++	 * routed (same behavior as the old 2-expert split).
 +	 */
 +	if (drv->state_count <= 1) {
 +		d->expert_mid = 0.0f;
++		d->expert_deep = 0.0f;
 +		return;
 +	}
 +
@@ -1365,6 +1291,31 @@ index 0000000000..59ced03672
 +		 */
 +		d->expert_mid = d->log2_cost[1] - 1.0f;
 +	}
++
++	/*
++	 * Deep expert boundary — deepest C-state split.
++	 *
++	 * When there are >= 3 C-states (state_count >= 4, counting POLL),
++	 * place the boundary at the midpoint between the second-deepest
++	 * and deepest state's log2(target_residency).  The deep expert
++	 * then exclusively handles sleep durations long enough to reach
++	 * the deepest state.
++	 *
++	 * With only 2 C-states, expert_deep == expert_mid collapses to
++	 * the 2-expert regime (expert 2 is never selected).
++	 */
++	deep_idx = drv->state_count - 1;
++	if (deep_idx >= 3) {
++		/* >= 3 C-states: split before the deepest */
++		d->expert_deep = (d->log2_cost[deep_idx - 1] +
++				  d->log2_cost[deep_idx]) / 2.0f;
++		/* Ensure deep > mid ordering */
++		if (d->expert_deep <= d->expert_mid)
++			d->expert_deep = d->expert_mid;
++	} else {
++		/* <= 2 C-states: collapse deep into long */
++		d->expert_deep = d->expert_mid;
++	}
 +}
 +
 +/* ================================================================
@@ -1375,21 +1326,17 @@ index 0000000000..59ced03672
 +	float avg;
 +	float min;
 +	float max;
-+	float stdev;
-+	float trend;
 +};
 +
 +/*
-+ * Compute all log_history statistics in one function: avg, min, max,
-+ * stdev (single-pass via E[x²]-E[x]²), and trend (older vs recent
-+ * half).  The trend loop accesses the same 8 elements already cached
-+ * by the stats loop, so fusing avoids a separate function call.
++ * Compute log_history statistics: avg, min, max.
++ * SIMD fast path when the ring buffer is full (8 elements = 2 × xmm).
 + */
 +static void logring_compute(const struct nap_cpu_data *d,
 +			    struct logring_stats *s)
 +{
 +	int i, n = d->hist_count;
-+	float sum, sq_sum, avg, inv_n, diff;
++	float sum;
 +
 +	if (n == 0) {
 +		*s = (struct logring_stats){ 0 };
@@ -1397,226 +1344,138 @@ index 0000000000..59ced03672
 +	}
 +
 +	if (n == NAP_HISTORY_SIZE) {
-+		/*
-+		 * SIMD fast path: all 8 elements as 2 × xmm.
-+		 * Pairwise reduce, then horizontal reduce 4→1.
-+		 */
 +		v4sf v0 = *(const v4sf *)&d->log_history[0];
 +		v4sf v1 = *(const v4sf *)&d->log_history[4];
-+		v4sf pmin, pmax, psum, psq, t;
++		v4sf pmin, pmax, psum, t;
 +
 +		pmin = __builtin_ia32_minps(v0, v1);
 +		pmax = __builtin_ia32_maxps(v0, v1);
 +		psum = v0 + v1;
-+		psq  = v0 * v0 + v1 * v1;
 +
-+		/* 4 → 2: fold high pair into low pair */
++		/* 4 → 2 */
 +		t = __builtin_ia32_movhlps(pmin, pmin);
 +		pmin = __builtin_ia32_minps(pmin, t);
 +		t = __builtin_ia32_movhlps(pmax, pmax);
 +		pmax = __builtin_ia32_maxps(pmax, t);
 +		t = __builtin_ia32_movhlps(psum, psum);
 +		psum = psum + t;
-+		t = __builtin_ia32_movhlps(psq, psq);
-+		psq = psq + t;
 +
-+		/* 2 → 1: broadcast lane 1, reduce with lane 0 */
++		/* 2 → 1 */
 +		t = __builtin_ia32_shufps(pmin, pmin, 0x55);
 +		pmin = __builtin_ia32_minps(pmin, t);
 +		t = __builtin_ia32_shufps(pmax, pmax, 0x55);
 +		pmax = __builtin_ia32_maxps(pmax, t);
 +		t = __builtin_ia32_shufps(psum, psum, 0x55);
 +		psum = psum + t;
-+		t = __builtin_ia32_shufps(psq, psq, 0x55);
-+		psq = psq + t;
 +
 +		sum = psum[0];
-+		sq_sum = psq[0];
 +		s->min = pmin[0];
 +		s->max = pmax[0];
 +	} else {
-+		/* Scalar fallback for n < NAP_HISTORY_SIZE (warmup) */
 +		float val;
 +
 +		sum = d->log_history[0];
-+		sq_sum = sum * sum;
 +		s->min = sum;
 +		s->max = sum;
 +
 +		for (i = 1; i < n; i++) {
 +			val = d->log_history[i];
 +			sum += val;
-+			sq_sum += val * val;
 +			s->min = float_min(s->min, val);
 +			s->max = float_max(s->max, val);
 +		}
 +	}
 +
-+	inv_n = 1.0f / (float)n;
-+	avg = sum * inv_n;
-+	s->avg = avg;
-+
-+	if (n < 2) {
-+		s->stdev = 0.0f;
-+		s->trend = 0.0f;
-+		return;
-+	}
-+
-+	/* Var = E[x²] - E[x]² — single-pass, no second loop needed */
-+	diff = sq_sum * inv_n - avg * avg;
-+	s->stdev = nap_sqrtf(float_max(diff, 0.0f));
-+
-+	/* Trend: compare older half vs recent half of the ring buffer */
-+	if (n < NAP_HISTORY_SIZE || avg == 0.0f) {
-+		s->trend = 0.0f;
-+	} else {
-+		int base = d->hist_idx;
-+		float older = 0.0f, recent = 0.0f;
-+
-+		for (i = 0; i < 4; i++) {
-+			older  += d->log_history[(base + i) & 7];
-+			recent += d->log_history[(base + 4 + i) & 7];
-+		}
-+		s->trend = (recent - older) / (4.0f * avg);
-+	}
++	s->avg = sum / (float)n;
 +}
 +
-+static u64 compute_irq_rate(const struct nap_cpu_data *d, u64 elapsed_ns)
-+{
-+	u64 cur_irq = kstat_cpu_irqs_sum(smp_processor_id());
-+	u64 delta_irq = cur_irq - d->prev_irq_count;
-+
-+	if (elapsed_ns == 0)
-+		return 0;
-+	return div_u64(delta_irq * NSEC_PER_SEC, elapsed_ns);
-+}
-+
++/*
++ * Extract 8 input features for the MLP.
++ *
++ *   [0] log2(sleep_length)           — next timer event
++ *   [1] log2(last_residency)         — actual duration of last idle
++ *   [2] log_hist avg                 — average recent idle duration
++ *   [3] log_hist min                 — shortest recent idle
++ *   [4] log_hist max                 — longest recent idle
++ *   [5] signed log2(|pred_error|+1)  — prediction feedback
++ *   [6] log2(busy_ns)               — pre-idle busy duration
++ *   [7] log2(lat_req) - log2(deepest_lat) — PM QoS headroom
++ */
 +static void nap_extract_features(struct cpuidle_driver *drv,
 +				 struct cpuidle_device *dev,
-+				 float out[NAP_NUM_FEATURES],
++				 float out[NAP_INPUT_SIZE],
 +				 s64 latency_req)
 +{
 +	struct nap_cpu_data *d = this_cpu_ptr(&nap_data);
 +	struct logring_stats lr;
 +	ktime_t sleep_length, delta_tick;
 +	u64 busy_ns;
-+	float log_inputs[4] __attribute__((aligned(16)));
-+	float log_results[4] __attribute__((aligned(16)));
++	float log_inputs[4] __aligned(16);
++	float log_results[4] __aligned(16);
 +
 +	sleep_length = tick_nohz_get_sleep_length(&delta_tick);
-+
 +	busy_ns = local_clock() - d->prev_idle_exit;
 +
-+	log_inputs[0] = (float)ktime_to_ns(sleep_length);
-+	log_inputs[1] = (float)dev->last_residency_ns;
-+	log_inputs[2] = (float)busy_ns;
-+	log_inputs[3] = (float)compute_irq_rate(d, busy_ns);
-+
-+	log_inputs[0] = float_max(log_inputs[0], 1.0f);
-+	log_inputs[1] = float_max(log_inputs[1], 1.0f);
-+	log_inputs[2] = float_max(log_inputs[2], 1.0f);
-+	log_inputs[3] = float_max(log_inputs[3], 1.0f);
-+
++	/*
++	 * SSE log2 batch: 4 values in one fast_log2f_sse call.
++	 *   [0] sleep_length   → out[0]
++	 *   [1] last_residency → out[1], also stored to log_history
++	 *   [2] busy_ns        → out[6]
++	 *   [3] |pred_error_us| + 1 → out[5] (sign restored after)
++	 */
 +	{
-+		v4sf log_in  = *(const v4sf *)log_inputs;
-+		v4sf log_out = fast_log2f_sse(log_in);
-+		*(v4sf *)log_results = log_out;
++		float err_f = (float)(d->last_prediction_error / 1000);
++		float abs_err = (err_f >= 0.0f) ? err_f : -err_f;
++
++		log_inputs[0] = float_max((float)ktime_to_ns(sleep_length), 1.0f);
++		log_inputs[1] = float_max((float)dev->last_residency_ns, 1.0f);
++		log_inputs[2] = float_max((float)busy_ns, 1.0f);
++		log_inputs[3] = abs_err + 1.0f;
++
++		{
++			v4sf log_in  = *(const v4sf *)log_inputs;
++			v4sf log_out = fast_log2f_sse(log_in);
++			*(v4sf *)log_results = log_out;
++		}
++
++		out[0] = log_results[0];
++		out[1] = log_results[1];
++		out[6] = log_results[2];
++
++		/* out[5]: sign-preserving log2(|err_us| + 1) */
++		{
++			union { float f; u32 i; } res = { .f = log_results[3] };
++			union { float f; u32 i; } sgn = { .f = err_f };
++
++			res.i |= sgn.i & 0x80000000u;
++			out[5] = res.f;
++		}
 +	}
 +
++	/* Update log_history ring buffer */
 +	{
 +		int prev = (d->hist_idx - 1 + NAP_HISTORY_SIZE) % NAP_HISTORY_SIZE;
 +		d->log_history[prev] = log_results[1];
 +	}
 +
-+	/* Compute log_history statistics in a single pass */
++	/* Compute log_history statistics: avg, min, max */
 +	logring_compute(d, &lr);
-+
-+	/* Group A: Time prediction */
-+	out[0] = log_results[0];
-+	out[1] = log_results[1];
 +	out[2] = lr.avg;
-+	out[3] = lr.stdev;
++	out[3] = lr.min;
++	out[4] = lr.max;
 +
-+	/* Group B: Pattern analysis */
-+	out[4] = lr.min;
-+	out[5] = lr.max;
-+	out[6] = lr.trend;
-+
-+	/* Sign-preserving log2 scale: maps ±N µs → ±log2(N+1) */
++	/* out[7]: log2(latency_req) - log2(deepest_lat), 0 if unconstrained */
 +	{
-+		float err_f = (float)(d->last_prediction_error / 1000);
++		u64 deepest_lat = drv->states[drv->state_count - 1]
++				      .exit_latency_ns;
++		bool lat_valid = (latency_req < PM_QOS_LATENCY_ANY_NS &&
++				  deepest_lat > 0);
 +
-+		out[10] = (err_f >= 0.0f)
-+			?  fast_log2f(err_f + 1.0f)
-+			: -fast_log2f(-err_f + 1.0f);
-+	}
-+	out[11] = log_results[2];
-+
-+	/* Group D: External signals */
-+	out[12] = tick_nohz_tick_stopped() ? 1.0f : 0.0f;
-+	out[13] = (float)min_t(unsigned int, nr_iowait_cpu(dev->cpu), 8)
-+		  * 0.125f;
-+	out[15] = log_results[3];
-+
-+	/*
-+	 * Batch 4 ratio features using SSE rcpps (~12-bit reciprocal
-+	 * approximation) + mulps.  Replaces 4× divss (~44-56 cycles)
-+	 * with 1× rcpps + 1× mulps (~5-8 cycles).  The 12-bit precision
-+	 * is adequate for NN inputs — weights compensate for any bias.
-+	 *
-+	 * Denominators are set to 1.0f when zero to avoid rcpps(0)=Inf
-+	 * and the resulting NaN from 0*Inf.
-+	 */
-+	{
-+		float nums[4] __aligned(16);
-+		float dens[4] __aligned(16);
-+		v4sf ratios;
-+		bool lat_valid;
-+
-+		/* out[7]: short_count / total_count */
-+		nums[0] = (float)d->short_count;
-+		dens[0] = (d->total_count > 0)
-+			? (float)d->total_count : 1.0f;
-+
-+		/* out[8]: total_above / total_usage */
-+		nums[1] = (float)d->total_above;
-+		dens[1] = (d->total_usage > 0)
-+			? (float)d->total_usage : 1.0f;
-+
-+		/* out[9]: intercept_recent / intercept_window */
-+		nums[2] = (float)d->intercept_recent;
-+		dens[2] = (d->intercept_window > 0)
-+			? (float)d->intercept_window : 1.0f;
-+
-+		/* out[14]: log2(latency_req) - log2(deepest_lat)
-+		 *
-+		 * Log2-space difference keeps the feature in the same
-+		 * scale as other log2-based inputs (features 0-5, 11, 15).
-+		 * When unconstrained (PM_QOS_LATENCY_ANY_NS), output 0
-+		 * so the feature is neutral.
-+		 */
-+		{
-+			u64 deepest_lat =
-+				drv->states[drv->state_count - 1]
-+				    .exit_latency_ns;
-+
-+			if (latency_req < PM_QOS_LATENCY_ANY_NS &&
-+			    deepest_lat > 0)
-+				out[14] = fast_log2f((float)latency_req)
-+					- fast_log2f((float)deepest_lat);
-+			else
-+				out[14] = 0.0f;
-+		}
-+
-+		/* Slot [3] unused — fill with 1/1 nop for SIMD lane */
-+		nums[3] = 1.0f;
-+		dens[3] = 1.0f;
-+
-+		ratios = *(const v4sf *)nums
-+			 * __builtin_ia32_rcpps(*(const v4sf *)dens);
-+		out[7]  = ratios[0];
-+		out[8]  = ratios[1];
-+		out[9]  = ratios[2];
++		if (lat_valid)
++			out[7] = fast_log2f(float_max((float)latency_req, 1.0f))
++			       - fast_log2f(float_max((float)deepest_lat, 1.0f));
++		else
++			out[7] = 0.0f;
 +	}
 +
 +	d->last_predicted_ns = ktime_to_ns(sleep_length);
@@ -1727,8 +1586,13 @@ index 0000000000..59ced03672
 +	 */
 +	nap_extract_features(drv, dev, d->features_f32, latency_req);
 +
-+	/* MoE: select expert based on log2(sleep_length) = features_f32[0] */
-+	d->active_expert = (d->features_f32[0] >= d->expert_mid) ? 1 : 0;
++	/* MoE: 3-way expert selection based on log2(sleep_length) */
++	if (d->features_f32[0] >= d->expert_deep)
++		d->active_expert = 2;		/* deep: deepest C-state */
++	else if (d->features_f32[0] >= d->expert_mid)
++		d->active_expert = 1;		/* long: nohz intermediate */
++	else
++		d->active_expert = 0;		/* short: tick-bound */
 +	d->active_w = &d->expert_weights[d->active_expert];
 +
 +	nap_nn_forward(d->features_f32, &d->nn_output, d->hidden_out,
@@ -1772,16 +1636,17 @@ index 0000000000..59ced03672
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx2.c b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
 new file mode 100644
-index 0000000000..d77fe8646f
+index 0000000000..96e5415423
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,135 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx2.c — AVX2+FMA forward pass and backpropagation for the nap MLP
 + *
-+ * 16→16→1 scalar regression (log2 correction factor).
-+ * Uses 256-bit ymm registers and vfmadd231ps for fused multiply-add.
++ * 8→8→1 scalar regression (log2 correction factor).
++ * Uses 256-bit ymm registers: 8 hidden neurons = 1 ymm.
++ * FMA via vfmadd231ps for fused multiply-add.
 + *
 + * Must be called within kernel_fpu_begin/end.
 + * Compiled with: CFLAGS += -mavx2 -mfma
@@ -1793,99 +1658,11 @@ index 0000000000..d77fe8646f
 +static inline v8sf v8sf_load(const float *p)   { return *(const v8sf *)p; }
 +static inline void v8sf_store(float *p, v8sf v) { *(v8sf *)p = v; }
 +
-+/* FMA: a*b+c — inline asm guarantees a single vfmaddps instruction
-+ * on both GCC and Clang without relying on compiler-specific builtins
-+ * or -ffp-contract settings.
-+ *
-+ * vfmadd231ps chosen over 213: the accumulator/destination is c ("+x"),
-+ * so live-through registers like v_neg_lr in the learn pass stay in
-+ * read-only operands and need no extra vmovaps copy. */
++/* FMA: a*b+c — vfmadd231ps: dest = src1 * src2 + dest */
 +static inline v8sf v8sf_fmadd(v8sf a, v8sf b, v8sf c)
 +{
-+	/* vfmadd231ps: dest = src1 * src2 + dest → c = a*b + c */
 +	asm("vfmadd231ps %2, %1, %0" : "+x"(c) : "x"(a), "xm"(b));
 +	return c;
-+}
-+
-+/*
-+ * Split forward pass into noinline helpers so that each layer gets its
-+ * own stack frame.  Without this, 8+8 ymm accumulators push the combined
-+ * frame over 2 KiB due to register spills.
-+ */
-+static noinline void
-+fwd_avx2_hidden(const float *input, float *hidden_save,
-+		const struct nap_weights *w)
-+{
-+	int j;
-+
-+	/*
-+	 * === Hidden layer: 16 outputs = 2×ymm, 4-way accumulator ===
-+	 *
-+	 * Break the FMA dependency chain (16 × 4cy = 64cy latency-bound)
-+	 * into 4 independent chains (4 × 4cy = 16cy each, overlapped).
-+	 * 8 ymm accumulators: a{0..3}_lo (lanes 0-7), a{0..3}_hi (lanes 8-15).
-+	 */
-+	v8sf a0_lo = v8sf_load(&w->b_h1[0]);
-+	v8sf a0_hi = v8sf_load(&w->b_h1[8]);
-+	v8sf a1_lo = V8SF_ZERO, a1_hi = V8SF_ZERO;
-+	v8sf a2_lo = V8SF_ZERO, a2_hi = V8SF_ZERO;
-+	v8sf a3_lo = V8SF_ZERO, a3_hi = V8SF_ZERO;
-+
-+	for (j = 0; j < NAP_INPUT_SIZE; j += 4) {
-+		v8sf x0 = V8SF_SET1(input[j]);
-+		v8sf x1 = V8SF_SET1(input[j + 1]);
-+		v8sf x2 = V8SF_SET1(input[j + 2]);
-+		v8sf x3 = V8SF_SET1(input[j + 3]);
-+
-+		a0_lo = v8sf_fmadd(v8sf_load(&w->w_h1[j][0]), x0, a0_lo);
-+		a0_hi = v8sf_fmadd(v8sf_load(&w->w_h1[j][8]), x0, a0_hi);
-+		a1_lo = v8sf_fmadd(v8sf_load(&w->w_h1[j + 1][0]), x1, a1_lo);
-+		a1_hi = v8sf_fmadd(v8sf_load(&w->w_h1[j + 1][8]), x1, a1_hi);
-+		a2_lo = v8sf_fmadd(v8sf_load(&w->w_h1[j + 2][0]), x2, a2_lo);
-+		a2_hi = v8sf_fmadd(v8sf_load(&w->w_h1[j + 2][8]), x2, a2_hi);
-+		a3_lo = v8sf_fmadd(v8sf_load(&w->w_h1[j + 3][0]), x3, a3_lo);
-+		a3_hi = v8sf_fmadd(v8sf_load(&w->w_h1[j + 3][8]), x3, a3_hi);
-+	}
-+
-+	/* ReLU: max(0, x) */
-+	{
-+		v8sf zero = V8SF_ZERO;
-+		v8sf lo = (a0_lo + a1_lo) + (a2_lo + a3_lo);
-+		v8sf hi = (a0_hi + a1_hi) + (a2_hi + a3_hi);
-+
-+		lo = __builtin_ia32_maxps256(lo, zero);
-+		hi = __builtin_ia32_maxps256(hi, zero);
-+		v8sf_store(&hidden_save[0], lo);
-+		v8sf_store(&hidden_save[8], hi);
-+	}
-+}
-+
-+static noinline void
-+fwd_avx2_output(float *output, const float *hidden_save,
-+		const struct nap_weights *w)
-+{
-+	/* === Output layer: dot(hidden[16], w_out[16]) + b_out → 1 scalar === */
-+	v8sf p_lo = v8sf_load(&w->w_out[0]) * v8sf_load(&hidden_save[0]);
-+	v8sf p_hi = v8sf_load(&w->w_out[8]) * v8sf_load(&hidden_save[8]);
-+	v8sf sum8 = p_lo + p_hi;
-+
-+	/* Horizontal reduce: 8 → 4 → scalar */
-+	{
-+		v4sf lo = __builtin_ia32_vextractf128_ps256(sum8, 0);
-+		v4sf hi = __builtin_ia32_vextractf128_ps256(sum8, 1);
-+		v4sf s4 = lo + hi;
-+
-+		*output = s4[0] + s4[1] + s4[2] + s4[3] + w->b_out;
-+	}
-+}
-+
-+void nap_nn_forward_avx2(const float *input,
-+			 float *output,
-+			 float *hidden_save,
-+			 const struct nap_weights *w)
-+{
-+	fwd_avx2_hidden(input, hidden_save, w);
-+	fwd_avx2_output(output, hidden_save, w);
 +}
 +
 +/* ymm clamp: max(min(v, hi), lo) */
@@ -1894,11 +1671,50 @@ index 0000000000..d77fe8646f
 +	return __builtin_ia32_maxps256(__builtin_ia32_minps256(v, hi), lo);
 +}
 +
++void nap_nn_forward_avx2(const float *input,
++			 float *output,
++			 float *hidden_save,
++			 const struct nap_weights *w)
++{
++	int j;
++
++	/* === Hidden layer: 8 outputs = 1×ymm, 2-way accumulator === */
++	v8sf acc0 = v8sf_load(&w->b_h1[0]);
++	v8sf acc1 = V8SF_ZERO;
++
++	for (j = 0; j < NAP_INPUT_SIZE; j += 2) {
++		v8sf x0 = V8SF_SET1(input[j]);
++		v8sf x1 = V8SF_SET1(input[j + 1]);
++
++		acc0 = v8sf_fmadd(v8sf_load(&w->w_h1[j][0]),     x0, acc0);
++		acc1 = v8sf_fmadd(v8sf_load(&w->w_h1[j + 1][0]), x1, acc1);
++	}
++
++	/* Merge accumulators + ReLU */
++	{
++		v8sf h = __builtin_ia32_maxps256(acc0 + acc1, V8SF_ZERO);
++
++		v8sf_store(hidden_save, h);
++
++		/* === Output layer: dot(hidden[8], w_out[8]) + b_out === */
++		{
++			v8sf p = v8sf_load(&w->w_out[0]) * h;
++
++			/* Horizontal reduce: 8 → 4 → scalar */
++			v4sf lo = __builtin_ia32_vextractf128_ps256(p, 0);
++			v4sf hi = __builtin_ia32_vextractf128_ps256(p, 1);
++			v4sf s4 = lo + hi;
++
++			*output = s4[0] + s4[1] + s4[2] + s4[3] + w->b_out;
++		}
++	}
++}
++
 +/*
 + * Online learning (backpropagation) — AVX2+FMA
 + *
-+ * Output: scalar d_out (MSE gradient, pre-computed by caller)
-+ * Hidden layer: 16 neurons = 2×ymm, with FMA
++ * Output: scalar d_out (pre-computed by caller)
++ * Hidden layer: 8 neurons = 1×ymm
 + */
 +void nap_nn_learn_avx2(struct nap_cpu_data *d)
 +{
@@ -1913,26 +1729,17 @@ index 0000000000..d77fe8646f
 +
 +	/*
 +	 * Hidden gradient: d_hid[j] = relu'(h[j]) * w_out[j] * d_out.
-+	 * vcmpps + vandps replaces the scalar conditional with a
-+	 * branchless SIMD mask (2×ymm = 16 neurons).
++	 * vcmpps + vandps: branchless SIMD mask (1×ymm = 8 neurons).
 +	 */
++	v8sf dh;
 +	{
 +		v8sf vd = V8SF_SET1(d_out_scalar);
-+		v8sf zero = V8SF_ZERO;
-+		v8sf g_lo, g_hi, m_lo, m_hi;
++		v8sf g = v8sf_load(&d->active_w->w_out[0]) * vd;
++		v8sf mask = __builtin_ia32_cmpps256(
++				v8sf_load(&d->hidden_out[0]), V8SF_ZERO, 14);
 +
-+		g_lo = v8sf_load(&d->active_w->w_out[0]) * vd;
-+		g_hi = v8sf_load(&d->active_w->w_out[8]) * vd;
-+		/* vcmpps GT_OS (pred 14): all-ones where h > 0 */
-+		m_lo = __builtin_ia32_cmpps256(
-+				v8sf_load(&d->hidden_out[0]), zero, 14);
-+		m_hi = __builtin_ia32_cmpps256(
-+				v8sf_load(&d->hidden_out[8]), zero, 14);
-+		/* vandps: zero out grad where h <= 0 */
-+		asm("vandps %2, %1, %0" : "=x"(g_lo) : "x"(g_lo), "xm"(m_lo));
-+		asm("vandps %2, %1, %0" : "=x"(g_hi) : "x"(g_hi), "xm"(m_hi));
-+		v8sf_store(&d_hid[0], g_lo);
-+		v8sf_store(&d_hid[8], g_hi);
++		asm("vandps %2, %1, %0" : "=x"(dh) : "x"(g), "xm"(mask));
++		v8sf_store(d_hid, dh);
 +	}
 +
 +	/* Output weight update: w_out[j] -= lr * clamp(h[j] * d_out) */
@@ -1940,269 +1747,45 @@ index 0000000000..d77fe8646f
 +		v8sf vd = V8SF_SET1(d_out_scalar);
 +		v8sf *w = (v8sf *)&d->active_w->w_out[0];
 +
-+		w[0] = v8sf_fmadd(v_neg_lr,
-+				   v8sf_clamp(v8sf_load(&d->hidden_out[0]) * vd,
-+					      v_cl_lo, v_cl_hi),
-+				   w[0]);
-+		w[1] = v8sf_fmadd(v_neg_lr,
-+				   v8sf_clamp(v8sf_load(&d->hidden_out[8]) * vd,
-+					      v_cl_lo, v_cl_hi),
-+				   w[1]);
++		*w = v8sf_fmadd(v_neg_lr,
++				v8sf_clamp(v8sf_load(&d->hidden_out[0]) * vd,
++					   v_cl_lo, v_cl_hi),
++				*w);
 +	}
 +
 +	/* Output bias update (scalar) */
 +	d->active_w->b_out -= lr * fclampf(d_out_scalar, -clamp_val, clamp_val);
 +
 +	/* Hidden weight update: w_h1[i][j] -= lr * clamp(feat[i] * d_hid[j]) */
-+	{
-+		v8sf dh0 = v8sf_load(&d_hid[0]);
-+		v8sf dh1 = v8sf_load(&d_hid[8]);
++	for (i = 0; i < NAP_INPUT_SIZE; i++) {
++		v8sf vf = V8SF_SET1(d->features_f32[i]);
++		v8sf *w = (v8sf *)&d->active_w->w_h1[i][0];
 +
-+		for (i = 0; i < NAP_INPUT_SIZE; i++) {
-+			v8sf vf = V8SF_SET1(d->features_f32[i]);
-+			v8sf *w = (v8sf *)&d->active_w->w_h1[i][0];
-+
-+			w[0] = v8sf_fmadd(v_neg_lr,
-+					  v8sf_clamp(vf * dh0, v_cl_lo, v_cl_hi),
-+					  w[0]);
-+			w[1] = v8sf_fmadd(v_neg_lr,
-+					  v8sf_clamp(vf * dh1, v_cl_lo, v_cl_hi),
-+					  w[1]);
-+		}
-+
-+		/* Hidden bias update */
-+		{
-+			v8sf *b = (v8sf *)&d->active_w->b_h1[0];
-+
-+			b[0] = v8sf_fmadd(v_neg_lr,
-+					  v8sf_clamp(dh0, v_cl_lo, v_cl_hi),
-+					  b[0]);
-+			b[1] = v8sf_fmadd(v_neg_lr,
-+					  v8sf_clamp(dh1, v_cl_lo, v_cl_hi),
-+					  b[1]);
-+		}
-+	}
-+}
-diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx512.c b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
-new file mode 100644
-index 0000000000..3ff057065b
---- /dev/null
-+++ b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
-@@ -0,0 +1,203 @@
-+// SPDX-License-Identifier: GPL-2.0
-+/*
-+ * nap_nn_avx512.c — AVX-512F forward pass and backpropagation for the nap MLP
-+ *
-+ * 16→16→1 scalar regression (log2 correction factor).
-+ * Uses 512-bit zmm registers. Hidden layer fits in a single zmm (16 floats).
-+ * Forward pass uses 4-way accumulator splitting to break FMA dependency chains.
-+ *
-+ * Must be called within kernel_fpu_begin/end.
-+ * Compiled with: CFLAGS += -mavx512f
-+ */
-+
-+#include "nap.h"
-+
-+/*
-+ * Inline asm wrappers for AVX-512F operations.
-+ *
-+ * Eliminates all #ifdef __clang__ / GCC builtin differences.
-+ * "v" constraint = xmm/ymm/zmm (AVX-512 register class).
-+ * The assembler selects EVEX encoding automatically for zmm operands.
-+ */
-+static inline v16sf v16sf_max(v16sf a, v16sf b)
-+{
-+	asm("vmaxps %2, %1, %0" : "=v"(a) : "v"(a), "vm"(b));
-+	return a;
-+}
-+
-+static inline v16sf v16sf_min(v16sf a, v16sf b)
-+{
-+	asm("vminps %2, %1, %0" : "=v"(a) : "v"(a), "vm"(b));
-+	return a;
-+}
-+
-+/* FMA: a*b+c — vfmadd231ps with c as read-write destination,
-+ * matching the accumulator pattern used in forward/learn passes. */
-+static inline v16sf v16sf_fmadd(v16sf a, v16sf b, v16sf c)
-+{
-+	/* vfmadd231ps: dest = src1 * src2 + dest → c = a*b + c */
-+	asm("vfmadd231ps %2, %1, %0" : "+v"(c) : "v"(a), "vm"(b));
-+	return c;
-+}
-+
-+/*
-+ * Split forward pass into noinline helpers so that each layer gets its
-+ * own stack frame.  Without this, the compiler allocates spill slots for
-+ * both layers simultaneously, pushing the combined frame over 2 KiB.
-+ */
-+static noinline void
-+fwd_avx512_hidden(const float *input, float *hidden_save,
-+		  const struct nap_weights *w)
-+{
-+	int j;
-+
-+	/*
-+	 * === Hidden layer: 16 outputs = 1×zmm, 4-way accumulator ===
-+	 *
-+	 * FMA has 4-cycle latency but 0.5-cycle throughput (2 ports).
-+	 * A single accumulator chain: 16 × 4 = 64 cycles (latency-bound).
-+	 * Four independent chains: max(4×4=16cy, throughput=16cy) ≈ 16-20cy.
-+	 * The compiler cannot do this automatically (-O2, no -ffast-math).
-+	 */
-+	v16sf a0 = *(const v16sf *)&w->b_h1[0];
-+	v16sf a1 = V16SF_SET1(0.0f);
-+	v16sf a2 = V16SF_SET1(0.0f);
-+	v16sf a3 = V16SF_SET1(0.0f);
-+
-+	for (j = 0; j < NAP_INPUT_SIZE; j += 4) {
-+		a0 = v16sf_fmadd(*(const v16sf *)&w->w_h1[j][0],
-+				  V16SF_SET1(input[j]), a0);
-+		a1 = v16sf_fmadd(*(const v16sf *)&w->w_h1[j + 1][0],
-+				  V16SF_SET1(input[j + 1]), a1);
-+		a2 = v16sf_fmadd(*(const v16sf *)&w->w_h1[j + 2][0],
-+				  V16SF_SET1(input[j + 2]), a2);
-+		a3 = v16sf_fmadd(*(const v16sf *)&w->w_h1[j + 3][0],
-+				  V16SF_SET1(input[j + 3]), a3);
++		*w = v8sf_fmadd(v_neg_lr,
++				v8sf_clamp(vf * dh, v_cl_lo, v_cl_hi),
++				*w);
 +	}
 +
-+	/* ReLU: max(0, x) */
++	/* Hidden bias update */
 +	{
-+		v16sf zero = V16SF_SET1(0.0f);
-+		v16sf acc = (a0 + a1) + (a2 + a3);
++		v8sf *b = (v8sf *)&d->active_w->b_h1[0];
 +
-+		acc = v16sf_max(acc, zero);
-+		*(v16sf *)&hidden_save[0] = acc;
-+	}
-+}
-+
-+static noinline void
-+fwd_avx512_output(float *output, const float *hidden_save,
-+		  const struct nap_weights *w)
-+{
-+	/* === Output layer: dot(hidden[16], w_out[16]) + b_out → 1 scalar === */
-+	v16sf prod = *(const v16sf *)&w->w_out[0] * *(const v16sf *)&hidden_save[0];
-+
-+	/* Horizontal reduce: zmm 16 → ymm 8 → xmm 4 → scalar */
-+	{
-+		v8sf hi8, lo8, sum8;
-+		v4sf hi4, lo4, s4;
-+
-+		/* vextractf64x4: AVX-512F — extract upper 256 bits */
-+		asm("vextractf64x4 $1, %1, %0" : "=v"(hi8) : "v"(prod));
-+		__builtin_memcpy(&lo8, &prod, sizeof(lo8));
-+		sum8 = lo8 + hi8;
-+
-+		lo4 = __builtin_ia32_vextractf128_ps256(sum8, 0);
-+		hi4 = __builtin_ia32_vextractf128_ps256(sum8, 1);
-+		s4 = lo4 + hi4;
-+
-+		*output = s4[0] + s4[1] + s4[2] + s4[3] + w->b_out;
-+	}
-+}
-+
-+void nap_nn_forward_avx512(const float *input,
-+			   float *output,
-+			   float *hidden_save,
-+			   const struct nap_weights *w)
-+{
-+	fwd_avx512_hidden(input, hidden_save, w);
-+	fwd_avx512_output(output, hidden_save, w);
-+}
-+
-+/* zmm clamp: max(min(v, hi), lo) */
-+static inline v16sf v16sf_clamp(v16sf v, v16sf lo, v16sf hi)
-+{
-+	return v16sf_max(v16sf_min(v, hi), lo);
-+}
-+
-+/*
-+ * Online learning (backpropagation) — AVX-512F
-+ *
-+ * Output: scalar d_out (MSE gradient, pre-computed by caller)
-+ * Hidden layer: 16 neurons = 1×zmm, with FMA
-+ */
-+void nap_nn_learn_avx512(struct nap_cpu_data *d)
-+{
-+	int i;
-+	float d_out_scalar = d->learn_d_out;
-+	float *d_hid = d->learn_d_hid;
-+	float lr = d->learn_lr;
-+	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
-+	v16sf v16_neg_lr = V16SF_SET1(-lr);
-+	v16sf v16_cl_hi  = V16SF_SET1(clamp_val);
-+	v16sf v16_cl_lo  = V16SF_SET1(-clamp_val);
-+
-+	/*
-+	 * Hidden gradient: d_hid[j] = relu'(h[j]) * w_out[j] * d_out.
-+	 * vcmpps → k-mask + zero-masked vmovaps: single zmm (16 neurons).
-+	 */
-+	{
-+		v16sf vd = V16SF_SET1(d_out_scalar);
-+		v16sf zero = V16SF_SET1(0.0f);
-+		v16sf h = *(const v16sf *)&d->hidden_out[0];
-+		v16sf g = *(const v16sf *)&d->active_w->w_out[0] * vd;
-+		v16sf result;
-+		unsigned short k;
-+
-+		/* vcmpps GT_OS (pred 14): k[i] = 1 iff h[i] > 0 */
-+		asm("vcmpps $14, %1, %2, %0"
-+		    : "=Yk"(k) : "v"(zero), "v"(h));
-+		/* Zero-masked move: result[i] = k[i] ? g[i] : 0 */
-+		asm("vmovaps %1, %0%{%2%}%{z%}"
-+		    : "=v"(result) : "v"(g), "Yk"(k));
-+		*(v16sf *)&d_hid[0] = result;
-+	}
-+
-+	/* Output weight update: w_out[j] -= lr * clamp(h[j] * d_out) */
-+	{
-+		v16sf vd = V16SF_SET1(d_out_scalar);
-+		v16sf *w = (v16sf *)&d->active_w->w_out[0];
-+
-+		*w = v16sf_fmadd(v16_neg_lr,
-+				 v16sf_clamp(*(const v16sf *)&d->hidden_out[0] * vd,
-+					     v16_cl_lo, v16_cl_hi),
-+				 *w);
-+	}
-+
-+	/* Output bias update (scalar) */
-+	d->active_w->b_out -= lr * fclampf(d_out_scalar, -clamp_val, clamp_val);
-+
-+	/* Hidden weight update: w_h1[i][j] -= lr * clamp(feat[i] * d_hid[j]) */
-+	{
-+		v16sf dh = *(const v16sf *)&d_hid[0];
-+
-+		for (i = 0; i < NAP_INPUT_SIZE; i++) {
-+			v16sf vf = V16SF_SET1(d->features_f32[i]);
-+			v16sf *w = (v16sf *)&d->active_w->w_h1[i][0];
-+
-+			*w = v16sf_fmadd(v16_neg_lr,
-+					 v16sf_clamp(vf * dh,
-+						     v16_cl_lo, v16_cl_hi),
-+					 *w);
-+		}
-+
-+		/* Hidden bias update */
-+		{
-+			v16sf *b = (v16sf *)&d->active_w->b_h1[0];
-+
-+			*b = v16sf_fmadd(v16_neg_lr,
-+					 v16sf_clamp(dh, v16_cl_lo, v16_cl_hi),
-+					 *b);
-+		}
++		*b = v8sf_fmadd(v_neg_lr,
++				v8sf_clamp(dh, v_cl_lo, v_cl_hi),
++				*b);
 +	}
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_sse2.c b/drivers/cpuidle/governors/nap/nap_nn_sse2.c
 new file mode 100644
-index 0000000000..1e18e94a09
+index 0000000000..a9fffb3b98
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_sse2.c
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,136 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_sse2.c — SSE2 forward pass and backpropagation for the nap MLP
 + *
-+ * 16→16→1 scalar regression (log2 correction factor).
++ * 8→8→1 scalar regression (log2 correction factor).
 + * Baseline implementation using SSE2, which is always available on x86_64.
 + * No FMA — uses separate mul + add (2 instructions per MAC).
 + *
@@ -2229,18 +1812,14 @@ index 0000000000..1e18e94a09
 +{
 +	int j;
 +
-+	/* === Hidden layer: 16 outputs = 4×xmm === */
++	/* === Hidden layer: 8 outputs = 2×xmm === */
 +	v4sf acc0 = v4sf_load(&w->b_h1[0]);
 +	v4sf acc1 = v4sf_load(&w->b_h1[4]);
-+	v4sf acc2 = v4sf_load(&w->b_h1[8]);
-+	v4sf acc3 = v4sf_load(&w->b_h1[12]);
 +
 +	for (j = 0; j < NAP_INPUT_SIZE; j++) {
 +		v4sf x = V4SF_SET1(input[j]);
-+		acc0 += v4sf_load(&w->w_h1[j][0])  * x;
-+		acc1 += v4sf_load(&w->w_h1[j][4])  * x;
-+		acc2 += v4sf_load(&w->w_h1[j][8])  * x;
-+		acc3 += v4sf_load(&w->w_h1[j][12]) * x;
++		acc0 += v4sf_load(&w->w_h1[j][0]) * x;
++		acc1 += v4sf_load(&w->w_h1[j][4]) * x;
 +	}
 +
 +	/* ReLU */
@@ -2249,21 +1828,15 @@ index 0000000000..1e18e94a09
 +
 +		acc0 = v4sf_max(acc0, zero);
 +		acc1 = v4sf_max(acc1, zero);
-+		acc2 = v4sf_max(acc2, zero);
-+		acc3 = v4sf_max(acc3, zero);
 +	}
-+	v4sf_store(&hidden_save[0],  acc0);
-+	v4sf_store(&hidden_save[4],  acc1);
-+	v4sf_store(&hidden_save[8],  acc2);
-+	v4sf_store(&hidden_save[12], acc3);
++	v4sf_store(&hidden_save[0], acc0);
++	v4sf_store(&hidden_save[4], acc1);
 +
-+	/* === Output layer: dot(hidden[16], w_out[16]) + b_out → 1 scalar === */
++	/* === Output layer: dot(hidden[8], w_out[8]) + b_out → 1 scalar === */
 +	{
-+		v4sf p0 = v4sf_load(&w->w_out[0])  * acc0;
-+		v4sf p1 = v4sf_load(&w->w_out[4])  * acc1;
-+		v4sf p2 = v4sf_load(&w->w_out[8])  * acc2;
-+		v4sf p3 = v4sf_load(&w->w_out[12]) * acc3;
-+		v4sf sum = (p0 + p1) + (p2 + p3);
++		v4sf p0 = v4sf_load(&w->w_out[0]) * acc0;
++		v4sf p1 = v4sf_load(&w->w_out[4]) * acc1;
++		v4sf sum = p0 + p1;
 +
 +		*output = sum[0] + sum[1] + sum[2] + sum[3] + w->b_out;
 +	}
@@ -2272,12 +1845,12 @@ index 0000000000..1e18e94a09
 +/*
 + * Online learning (backpropagation) — SSE2
 + *
-+ * Output: scalar d_out (MSE gradient, pre-computed by caller)
-+ * Hidden layer: 16 neurons = 4×xmm
++ * Output: scalar d_out (pre-computed by caller)
++ * Hidden layer: 8 neurons = 2×xmm
 + */
 +void nap_nn_learn_sse2(struct nap_cpu_data *d)
 +{
-+	int i, j;
++	int i;
 +	float d_out_scalar = d->learn_d_out;
 +	float *d_hid = d->learn_d_hid;
 +	float lr = d->learn_lr;
@@ -2289,21 +1862,23 @@ index 0000000000..1e18e94a09
 +	/*
 +	 * Hidden gradient: d_hid[j] = relu'(h[j]) * w_out[j] * d_out.
 +	 * Must be computed before output weight update to use pre-update
-+	 * w_out.  With scalar d_out, no horizontal sum is needed.
++	 * w_out.
 +	 */
 +	{
 +		v4sf vd = V4SF_SET1(d_out_scalar);
 +		v4sf zero = V4SF_SET1(0.0f);
++		v4sf h, g;
++		v4si m;
 +
-+		for (j = 0; j < NAP_HIDDEN_SIZE; j += 4) {
-+			v4sf h = v4sf_load(&d->hidden_out[j]);
-+			v4sf g = v4sf_load(&d->active_w->w_out[j]) * vd;
-+			/* ReLU': all-ones where h > 0, zero otherwise */
-+			v4si m = (v4si)(h > zero);
++		h = v4sf_load(&d->hidden_out[0]);
++		g = v4sf_load(&d->active_w->w_out[0]) * vd;
++		m = (v4si)(h > zero);
++		v4sf_store(&d_hid[0], v4si_as_v4sf(v4sf_as_v4si(g) & m));
 +
-+			v4sf_store(&d_hid[j],
-+				   v4si_as_v4sf(v4sf_as_v4si(g) & m));
-+		}
++		h = v4sf_load(&d->hidden_out[4]);
++		g = v4sf_load(&d->active_w->w_out[4]) * vd;
++		m = (v4si)(h > zero);
++		v4sf_store(&d_hid[4], v4si_as_v4sf(v4sf_as_v4si(g) & m));
 +	}
 +
 +	/* Output weight update: w_out[j] -= lr * clamp(h[j] * d_out) */
@@ -2311,13 +1886,9 @@ index 0000000000..1e18e94a09
 +		v4sf vd = V4SF_SET1(d_out_scalar);
 +		v4sf *w = (v4sf *)&d->active_w->w_out[0];
 +
-+		w[0] -= v_lr * v4sf_clamp(v4sf_load(&d->hidden_out[0])  * vd,
++		w[0] -= v_lr * v4sf_clamp(v4sf_load(&d->hidden_out[0]) * vd,
 +					  v_cl_lo, v_cl_hi);
-+		w[1] -= v_lr * v4sf_clamp(v4sf_load(&d->hidden_out[4])  * vd,
-+					  v_cl_lo, v_cl_hi);
-+		w[2] -= v_lr * v4sf_clamp(v4sf_load(&d->hidden_out[8])  * vd,
-+					  v_cl_lo, v_cl_hi);
-+		w[3] -= v_lr * v4sf_clamp(v4sf_load(&d->hidden_out[12]) * vd,
++		w[1] -= v_lr * v4sf_clamp(v4sf_load(&d->hidden_out[4]) * vd,
 +					  v_cl_lo, v_cl_hi);
 +	}
 +
@@ -2328,8 +1899,6 @@ index 0000000000..1e18e94a09
 +	{
 +		v4sf dh0 = *(const v4sf *)&d_hid[0];
 +		v4sf dh1 = *(const v4sf *)&d_hid[4];
-+		v4sf dh2 = *(const v4sf *)&d_hid[8];
-+		v4sf dh3 = *(const v4sf *)&d_hid[12];
 +
 +		for (i = 0; i < NAP_INPUT_SIZE; i++) {
 +			v4sf vf = V4SF_SET1(d->features_f32[i]);
@@ -2337,8 +1906,6 @@ index 0000000000..1e18e94a09
 +
 +			w[0] -= v_lr * v4sf_clamp(vf * dh0, v_cl_lo, v_cl_hi);
 +			w[1] -= v_lr * v4sf_clamp(vf * dh1, v_cl_lo, v_cl_hi);
-+			w[2] -= v_lr * v4sf_clamp(vf * dh2, v_cl_lo, v_cl_hi);
-+			w[3] -= v_lr * v4sf_clamp(vf * dh3, v_cl_lo, v_cl_hi);
 +		}
 +
 +		/* Hidden bias update: b_h1[j] -= lr * clamp(d_hid[j]) */
@@ -2347,8 +1914,6 @@ index 0000000000..1e18e94a09
 +
 +			b[0] -= v_lr * v4sf_clamp(dh0, v_cl_lo, v_cl_hi);
 +			b[1] -= v_lr * v4sf_clamp(dh1, v_cl_lo, v_cl_hi);
-+			b[2] -= v_lr * v4sf_clamp(dh2, v_cl_lo, v_cl_hi);
-+			b[3] -= v_lr * v4sf_clamp(dh3, v_cl_lo, v_cl_hi);
 +		}
 +	}
 +}
