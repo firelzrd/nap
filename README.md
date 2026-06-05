@@ -1,6 +1,6 @@
 # Nap (Neural Adaptive Predictor) CPUIdle Governor
 
-A Linux kernel CPUIdle governor that uses a MLP-based neural network to learn the optimal idle state for each CPU online.
+A Linux kernel CPUIdle governor that learns the optimal idle state for each CPU online with a small in-kernel neural network.
 
 <div align="center"><img width="416" height="369" alt="nap" src="https://github.com/user-attachments/assets/a2861a8d-15cf-4b0e-9c09-6c86001ebbb7" /></div>
 
@@ -8,23 +8,45 @@ A Linux kernel CPUIdle governor that uses a MLP-based neural network to learn th
 
 Traditional CPUIdle governors (`ladder`, `menu`, `teo`) rely on fixed heuristics to predict how long a CPU will sleep and select an idle state accordingly. These heuristics are effective for common patterns but struggle with irregular or shifting workloads.
 
-Nap (Neural Adaptive Predictor) replaces the heuristic with a three-expert MoE regression model that runs entirely in-kernel. Each CPU maintains three 8-8-1 MLPs — one specializing in short (tick-bound) sleeps, one in intermediate (nohz) sleeps, and one in deep (deepest C-state) sleeps — and selects the appropriate expert based on the predicted sleep length. The networks learn online via deferred backpropagation with an asymmetric overshoot loss, converging the overshoot probability to a configurable target (default 8%). SIMD-accelerated forward and backward passes (SSE2 / AVX2+FMA) keep inference overhead negligible. A POLL short-circuit fast path bypasses NN inference entirely when the predicted sleep is too short for any C-state.
+Nap (Neural Adaptive Predictor) replaces the heuristic with a single small MLP trunk feeding an **ordinal survival head**, running entirely in-kernel per CPU. Instead of regressing one point estimate of the sleep length, the network predicts, for each idle-state boundary, the probability that the upcoming idle lasts at least that state's `target_residency`. The decision layer blends this prediction with a per-CPU decayed histogram of recently observed idle depths (Beta-Binomial shrinkage) and picks the deepest feasible state whose calibrated survival probability still clears a configurable confidence level. The network learns online via deferred backpropagation; SIMD-accelerated forward and backward passes (SSE2 / AVX2+FMA) keep inference overhead negligible, and a POLL short-circuit fast path bypasses the NN entirely when the predicted sleep is too short for any C-state.
+
+There is **no mixture of experts** — a single network handles every sleep-length regime. Multimodality and workload shifts are absorbed by the decayed-histogram floor in the decision layer, which also makes online learning robust against catastrophic forgetting.
 
 ## How It Works
 
 ### Neural Network Architecture
 
-Each expert is an 8-8-1 multi-layer perceptron:
+Each CPU owns a single 8-8-1 multi-layer perceptron trunk:
 
 | Layer | Size | Activation |
 |---|---|---|
 | Input | 8 features | - |
 | Hidden | 8 neurons | ReLU |
-| Output | 1 neuron | Linear |
+| Score | 1 scalar `s` | Linear |
 
-Parameters per expert: 81 (8×8 + 8 + 8 + 1). Total parameters: 243 (3 experts), active parameters per inference: 81.
+Trunk parameters: 81 (8×8 + 8 + 8 + 1), plus one ordered threshold per idle-state boundary. The scalar score `s` is approximately the log2 of the predicted idle duration in nanoseconds; it is consumed by the ordinal survival head below rather than used directly as a sleep-length estimate.
 
-The output is a scalar in log2 space representing the predicted sleep duration in nanoseconds. Idle state selection is performed by comparing this value against precomputed log2 cost thresholds (`target_residency_ns` only; exit latency is a wakeup cost, not a factor in residency profitability) for each state, choosing the deepest state whose cost does not exceed the prediction.
+### Ordinal Survival Head
+
+For each idle-state boundary *k*, the network's survival probability is a proportional-odds model over the shared score:
+
+```
+q_nn_k = sigmoid(s − thr_ord[k−1])
+```
+
+with one ordered threshold `thr_ord[k−1]` per boundary, seeded at `log2(target_residency[k])`. This represents the idle-duration distribution at exactly the points the decision needs (the sufficient statistic), rather than a single point estimate.
+
+### Decision Layer
+
+The decision shrinks the NN prior toward observed data — a per-CPU decayed histogram `bin_count[]` of how often recent idles reached each depth — via Beta-Binomial shrinkage:
+
+```
+q_k = (K · q_nn_k + count(idle ≥ k)) / (K + total),   K = 16 pseudo-observations
+```
+
+The NN drives cold start; the floor takes over as samples accumulate. This shrinkage is what replaces a mixture of experts: it carries any multimodality of the idle distribution, and it keeps decisions stable even if the NN drifts. A running minimum enforces a monotone non-increasing survival curve, and the next timer event caps the reachable depth (`q_k = 0` for any state whose target residency lies past the next timer — it cannot be earned).
+
+Nap then selects the **deepest feasible** state — enabled, and with `exit_latency_ns ≤` the PM QoS latency request — whose survival `q_k` still meets the confidence level (default 0.5).
 
 ### POLL Short-Circuit Fast Path
 
@@ -32,22 +54,7 @@ Before invoking the NN, `nap_select()` checks whether the predicted sleep length
 
 - The shallowest valid C-state is cached per-CPU and invalidated when the PM QoS latency request changes or after `NAP_MIN_STATE_REFRESH_JIFFIES` (1 second).
 - `poll_limit_ns` is set to `sleep_length + 1 µs` margin, clamped between 1 µs and the shallowest C-state's target residency.
-- `nap_reflect()` skips history, learning, and all NN-related bookkeeping for short-circuited events, updating only the aggregate residency statistic. This prevents noisy POLL-duration samples from contaminating the NN's training distribution.
-
-### Mixture of Experts
-
-Three experts specialize on different workload regimes:
-
-- **Expert 0 (short)** — tick-bound idles (log2(sleep_length) < `expert_mid`)
-- **Expert 1 (long)** — nohz intermediate idles (`expert_mid` ≤ log2(sleep_length) < `expert_deep`)
-- **Expert 2 (deep)** — deepest C-state idles (log2(sleep_length) ≥ `expert_deep`)
-
-Two boundaries partition the sleep-length space:
-
-1. **`expert_mid`** (short ↔ long) — tied to the tick period (`TICK_NSEC`): the first C-state whose target residency exceeds one jiffy marks the start of the "long" regime. This separates tick-bound idles (where measured residency is dominated by the next tick, producing noisy gradients) from nohz idles (where residency reflects the workload's true idle duration). If all states exceed one jiffy, the boundary is placed just below C1 so the short expert remains routable but unused.
-2. **`expert_deep`** (long ↔ deep) — placed at the midpoint between the second-deepest and deepest C-state's log2(target_residency). The deepest C-state often has qualitatively different residency characteristics (package C-state, longer exit latency, power-gated domains) that warrant a dedicated expert to avoid gradient interference with intermediate states. On hardware with only 2 C-states, `expert_deep` collapses to `expert_mid`, effectively reducing to a 2-expert regime.
-
-On each idle entry, feature\[0\] (log2 of the next timer event) is compared against both thresholds to select the active expert. Only the selected expert runs the forward pass and receives weight updates.
+- `nap_reflect()` skips history, learning, the floor sample, and all NN-related bookkeeping for short-circuited events, updating only the aggregate residency statistic. This prevents noisy POLL-duration samples from contaminating the NN's training distribution.
 
 ### Input Features
 
@@ -66,25 +73,24 @@ The 8 input features are selected via gradient-based importance analysis, retain
 
 ### Online Learning
 
-After each idle exit, the governor compares the selected state against the post-hoc ideal state derived from actual residency. Learning is governed by a dual gate: it fires only when both the reflect counter reaches `learn_interval` (default: 4) **and** at least `learn_jiffies_min` jiffies (default: 1) have elapsed since the last learning step. The time gate prevents sustained weight churn on workloads with very rapid idle bursts; setting it to 0 restores the original counter-only behavior.
+The decayed-histogram floor updates on **every** (non-short-circuited) idle, keeping the data term current. The trunk and ordinal thresholds update on a throttled schedule — a dual gate fires only when the reflect counter reaches `learn_interval` (default 4) **and** at least one jiffy has elapsed since the last step. The time gate caps weight churn on workloads with very rapid idle bursts; it has no effect on steady workloads.
 
-The loss function is a direct overshoot loss with asymmetric learning rates:
+The loss is the proportional-odds (ordinal) log-likelihood. Because all boundaries share the score `s`, the gradient with respect to `s` collapses to a single scalar:
 
-- **Overshoot** (selected state too deep for actual residency): gradient pushes the output down with learning rate `base_lr * (1 - alpha)`
-- **No overshoot**: gradient pushes the output up with learning rate `base_lr * alpha`
+```
+g = Σ_k (q_k − y_k),   y_k = 1 if measured_residency ≥ target_residency[k] else 0
+```
 
-where `alpha` is the target overshoot percentile (default: 0.10). At equilibrium, P(overshoot) converges to `alpha`. Gradients are element-wise clipped to `[-max_grad_norm, +max_grad_norm]`.
-
-When the network output is clamped at the upper bound (prediction equals sleep length), non-overshoot gradients are suppressed to prevent unbounded weight growth in always-idle systems.
+which drives the SIMD trunk backpropagation; each ordered threshold additionally moves by its own `(q_k − y_k)`. The loss is **symmetric** — all responsiveness lives in the decision-layer confidence dial, not in an asymmetric learning signal. Gradients are element-wise clipped to `[−max_grad_norm, +max_grad_norm]`.
 
 ### Weight Initialization
 
-- Hidden layer: Xavier uniform (deterministic PRNG, seed = 42)
-- Output layer: uniform [-0.01, 0.01]
+- Hidden layer: Xavier uniform (deterministic PRNG)
+- Output (score) weights: near-zero, for ~0 initial learned contribution
 - All biases: zero
 - **Neuron 0 pass-through**: `w_h1[0][0] = 1.0`, `w_out[0] = 1.0`, all other inputs to neuron 0 zeroed
 
-The pass-through initialization ensures the initial output approximates `log2(sleep_length)`, providing sensible state selection before any learning occurs.
+The pass-through initialization makes the initial score `s ≈ log2(sleep_length)`, and the thresholds are seeded at each boundary's `log2(target_residency)`, so before any learning the decision reproduces the classic "deepest state that fits the predicted sleep" behavior.
 
 ### SIMD Dispatch
 
@@ -93,7 +99,7 @@ At governor enable time, Nap probes the CPU feature set and selects the fastest 
 1. AVX2 + FMA (8 hidden neurons = 1 ymm register)
 2. SSE2 (baseline; 8 hidden neurons = 2 xmm registers)
 
-All FPU/SIMD code is compiled into separate translation units and wrapped in `kernel_fpu_begin()`/`kernel_fpu_end()` to prevent corruption of userspace FPU state.
+AVX-512 is intentionally not used: with an 8-wide hidden layer a zmm register would run half-empty for the same instruction count, and on Intel parts the AVX-512 frequency license would hurt wakeup latency. All FPU/SIMD code is compiled into separate translation units and wrapped in `kernel_fpu_begin()`/`kernel_fpu_end()` to prevent corruption of userspace FPU state.
 
 ## Tunables
 
@@ -106,38 +112,47 @@ Exposed under `/sys/devices/system/cpu/nap/`:
 | `stats` | *(read-only)* | Total selects, residency, overshoot count/rate, learn count |
 | `learning_rate` | `1` | Learning rate in thousandths (1 = 0.001) |
 | `learn_interval` | `4` | Backpropagation frequency (every N reflects) |
-| `learn_jiffies_min` | `1` | Minimum jiffies between learning steps (0 = disabled) |
-| `overshoot_pctl` | `100` | Target overshoot percentile in thousandths (100 = 10%) |
-| `reset_weights` | *(write-only)* | Trigger weight reinitialization (`all` or cpulist e.g. `0-3,5,7`) |
+| `confidence` | `500` | Decision confidence in thousandths (500 = 0.5; range 1–999). A state is chosen only if its survival probability clears this. **Higher** = more conservative (shallower, lower wakeup-latency risk); **lower** = more aggressive (deeper, more energy savings). |
+| `reset_weights` | *(write-only)* | Trigger weight reinitialization (`all` or cpulist, e.g. `0-3,5,7`) |
 | `reset_stats` | *(write-only)* | Reset statistics counters |
 
-## Benchmark: Overshoot Rate
+## Benchmark: selection quality vs `teo`
 
-Overshoot rate measures how often a governor selects a C-state deeper than the actual residency justifies. Lower is better.
+Selection quality is measured with the governor-agnostic cpuidle `above`/`below`/`usage` counters (the kernel's own per-state miss accounting), so it is an oracle metric, not a governor self-report:
 
-| Governor | Overshoot Rate |
-|----------|---------------|
-| **nap**  | 4.2%         |
-| teo      | 19.70%     |
-| menu     | 47.27%       |
+- **miss%** = (above + below) / usage — overall mis-selection (lower is better)
+- **above%** = overshoot (too deep; a wakeup-latency cost)
+- **below%** = undershoot (too shallow; an energy cost)
 
-Measured with [this patch](https://github.com/firelzrd/nap/blob/main/tests/0002-menu-teo-overshoot-rate-sysfs.patch) applied on moderately idle desktop (10-second sample per governor, Linux 6.18, AMD Zen):
+`teo` is **co-measured in the same boot** as a drift anchor — a single governor's absolute miss% drifts between boots with thermal/frequency state, so the meaningful signal is the `nap − teo` margin. Harness: `tests/` (16-CPU x86_64, AVX2, 5 reps, 3 s warmup + 10 s window).
 
-```sh
-for gov in menu teo nap; do
-  echo $gov | sudo tee /sys/devices/system/cpu/cpuidle/current_governor
-  sleep 10
-  grep -R . /sys/devices/system/cpu/$gov/stats
-done
-```
+### Synthetic sweep — miss% across fixed idle durations
+
+| idle duration | **nap** | teo | nap advantage |
+|---|---|---|---|
+| 10 µs | **0.96** | 1.98 | 2.1× |
+| 50 µs | **0.44** | 6.00 | **13.6×** |
+| 200 µs | **0.99** | 7.97 | 8.1× |
+| 1 ms | **4.87** | 18.11 | 3.7× (and lower power: 7.26 W vs 8.13 W) |
+| 5 ms | **13.36** | 15.14 | 1.1× |
+
+### Real workloads — miss%
+
+| workload | **nap** | teo |
+|---|---|---|
+| pingpong (cross-CPU non-timer wakeups, intercept regime) | **3.44** | 7.02 |
+| fio (bursty IO with think-time, iowait regime) | **1.22** | 1.88 |
+| idle (desktop-idle mix) | **25.50** | 26.63 (nap also lower power: 6.77 W vs 6.86 W) |
+
+nap selects more accurately than `teo` at every operating point measured — 3–13× fewer mis-selections on the synthetic sweep and ~2× on the intercept-heavy pingpong workload — at equal or lower package power. The reproduction harness, raw CSVs, and full methodology (including the boot-to-boot drift analysis) live in `tests/` and `v0.5.0-port-validation.md`.
 
 ## Installation
 
-Nap is delivered as a kernel patch. Apply it to the Linux 6.18.3 source tree and enable `CONFIG_CPU_IDLE_GOV_NAP=y`:
+Nap is delivered as a kernel patch. Apply the patch for your kernel version from the `patches/` directory and enable `CONFIG_CPU_IDLE_GOV_NAP=y`:
 
 ```sh
 cd /path/to/linux
-patch -p1 < /path/to/nap/patches/stable/0001-6.18.3-nap-v0.4.0.patch
+patch -p1 < /path/to/nap/patches/stable/<kernel-version>-nap-v0.5.0.patch
 ```
 
 ### Activate
