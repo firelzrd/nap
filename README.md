@@ -1,150 +1,144 @@
 # Nap (Neural Adaptive Predictor) CPUIdle Governor
 
-A Linux kernel CPUIdle governor that learns the optimal idle state for each CPU online with a small in-kernel neural network.
+A Linux kernel CPUIdle governor that predicts the distribution of the upcoming idle time with a small in-kernel neural network, learns online on every CPU, and picks the idle state that saves the most energy for a **budget of avoidable wakeup latency** you set.
 
 <div align="center"><img width="416" height="369" alt="nap" src="https://github.com/user-attachments/assets/a2861a8d-15cf-4b0e-9c09-6c86001ebbb7" /></div>
 
-## Overview
+## Why Nap
 
-Traditional CPUIdle governors (`ladder`, `menu`, `teo`) rely on fixed heuristics to predict how long a CPU will sleep and select an idle state accordingly. These heuristics are effective for common patterns but struggle with irregular or shifting workloads.
+`ladder`, `menu` and `teo` choose an idle state with fixed heuristics: they estimate how long the CPU will sleep and go as deep as that allows. None of them has an explicit objective for what a wrong choice costs the user. Going too deep costs wakeup latency; going too shallow costs energy. The only dial is the PM QoS limit, which is all or nothing.
 
-Nap (Neural Adaptive Predictor) replaces the heuristic with a single small MLP trunk feeding an **ordinal survival head**, running entirely in-kernel per CPU. Instead of regressing one point estimate of the sleep length, the network predicts, for each idle-state boundary, the probability that the upcoming idle lasts at least that state's `target_residency`. The decision layer blends this prediction with a per-CPU decayed histogram of recently observed idle depths (Beta-Binomial shrinkage) and picks the deepest feasible state whose calibrated survival probability still clears a configurable confidence level. The network learns online via deferred backpropagation; SIMD-accelerated forward and backward passes (SSE2 / AVX2+FMA) keep inference overhead negligible, and a POLL short-circuit fast path bypasses the NN entirely when the predicted sleep is too short for any C-state.
+Nap makes the trade explicit:
 
-There is **no mixture of experts** — a single network handles every sleep-length regime. Multimodality and workload shifts are absorbed by the decayed-histogram floor in the decision layer, which also makes online learning robust against catastrophic forgetting.
+- **It optimises what the user feels.** The cost of going deeper than the idle deserved is the *avoidable wakeup latency*: the exit latency of the state entered minus that of the state that fits the idle. Nap chooses, for every idle, the state (and whether to stop the tick) that minimises `energy + λ · avoidable latency`.
+- **You set a budget, not a heuristic.** `budget_ppm` is the share of the wall-clock time a CPU may lose to avoidable wakeup latency. A per-CPU controller adapts λ to keep within it. A CPU that wakes rarely may take deep states with long exit latencies; one that wakes thousands of times a second is held to short ones.
+- **It predicts a distribution, not a number.** The network outputs `P(idle ≥ t)` on a fixed time grid (0.5 µs … 16.8 ms, one point per octave), so nothing in it depends on the idle-state table. Any machine's `target_residency` / `exit_latency` are read off the grid at run time.
+- **It learns, and what it learns can be kept.** Weights adapt online on every CPU. They can be dumped, loaded, averaged and restored across reboots (see [Keeping what it learned](#keeping-what-it-learned)).
+
+### How it compares
+
+Measured on one machine (Ryzen 7 7840HS, 16 threads, idle states POLL / C1 / C2 / C3), on an idle desktop and six synthetic loads: *media* (60 Hz frame + audio timers), *game*, *interactive*, *build* (many short compiler processes), *I/O*, *mixed*. 12 s per cell, 2 rounds. `teo` and `menu` are recorded with a transparent wrapper governor and scored with the same definition of avoidable latency on every idle; Nap v0.6.0 (measured as a module build of the same source) reports the same quantity itself.
+
+**Avoidable wakeup latency per idle (µs), and the share of CPU time lost to it (ppm)**
+
+| load | teo | menu | **Nap v0.6.0** (budget 4000 ppm) |
+|---|---|---|---|
+| idle | 73 / 18 068 | 75 / 12 597 | **10.8 / 3 196** |
+| media | 78 / 14 286 | 79 / 14 716 | **10.6 / 3 378** |
+| game | 100 / 20 102 | 100 / 18 646 | **10.9 / 3 510** |
+| interactive | 82 / 13 548 | 78 / 12 203 | **11.2 / 3 175** |
+| build | 25 / 33 416 | 30 / 32 758 | **3.6 / 4 776** |
+| I/O | 94 / 31 199 | 110 / 41 297 | **9.9 / 4 941** |
+| mixed | 105 / 45 998 | 125 / 50 289 | **10.3 / 5 137** |
+
+`teo` and `menu` lose 1.2–5.0 % of the CPU time to avoidable wakeup latency; Nap v0.6.0 loses 0.3–0.5 %, 4 to 9 times less (and 7 to 10 times less per idle). `teo` and `menu` are indistinguishable from each other here.
+
+**Measured wakeup latency** (cyclictest, mean over threads, µs; ranges over the measurement sessions)
+
+| | teo | menu | **Nap v0.6.0** |
+|---|---|---|---|
+| 1 ms timer, with background load | 0–1 | 1–4 | **1** |
+| 1.5 ms timer next to it | 8–29 | 8–17 | **4–14** |
+| 4 threads, 500 µs | 1–31 | 1–29 | 1–35 (no difference) |
+
+**Power** is within the measurement noise of `teo` (about ±2 %, interleaved runs): for example 9.4–9.6 W (Nap v0.6.0) against 9.5–10.1 W (`teo`) on the 4-thread cyclictest, 13.5 W against 13.2–13.3 W with the 1 ms timer plus load.
+
+**What this does not show.**
+
+- It is one machine. Nothing here says how Nap behaves on Intel parts with ten C-states or on ARM. The network is state-table independent by construction, but the pretrained prior and the default power ladder come from this machine.
+- The synthetic loads were generated for this study, and the pretrained weights were trained on recordings of the same kinds of loads. Treat the gains as an upper bound for real use.
+- Nap does not make fewer wrong choices on an idle desktop: an earlier build with a different cost function matched `teo`'s `above`/`below` fractions (about 18 % too deep, 9 % too shallow). v0.6.0 deliberately spends more time in states shallower than ideal (hundreds of ms per CPU-second against tens for `teo`) and enters more idles; that is the price of the lower latency, and it showed no measurable power cost here.
+- Each cell is 12 s and two rounds; power differences below about 0.5 W are noise on this machine.
+- On this CPU C2 and C3 draw about the same power at the measured wake rates: with C3 disabled the idle package power was not higher (8.6 W against 9.2 W, three rounds under `teo`). Deep states buy little here, which is part of why a latency-first budget costs no measurable power. On CPUs where deeper states save real power the trade will look different, and it is untested.
 
 ## How It Works
 
-### Neural Network Architecture
+```
+ raw signals ──► 16 features ──► network ──► P(idle ≥ t) on a time grid ──┐
+ (timer, history, busy period,     (online-trained)                        │
+  wake sources, tick)                                                      ▼
+                    budget_ppm ──► per-CPU controller ──► λ ──► choose (state, stop tick)
+                                                                  minimising E + λ·L
+```
 
-Each CPU owns a single 8-8-1 multi-layer perceptron trunk:
+### Features (16)
 
-| Layer | Size | Activation |
+| # | feature | kind |
 |---|---|---|
-| Input | 8 features | - |
-| Hidden | 8 neurons | ReLU |
-| Score | 1 scalar `s` | Linear |
+| 0 | log2(time to next timer) | time |
+| 1 | log2(next timer / next tick) | dense |
+| 2 | busy CPUs | dense |
+| 3 | wakeups in the last 50 µs (system wide) | dense |
+| 4 | wakeups in the last 1 ms (system wide) | dense |
+| 5 | log2(length of the last busy period) | time |
+| 6 | interrupts during that busy period | dense |
+| 7–12 | log2(last six idle lengths) | time |
+| 13–15 | wake sources of the last wakeup: device IRQ, local timer, call-function IPI | dense |
 
-Trunk parameters: 81 (8×8 + 8 + 8 + 1), plus one ordered threshold per idle-state boundary. The scalar score `s` is approximately the log2 of the predicted idle duration in nanoseconds; it is consumed by the ordinal survival head below rather than used directly as a sleep-length estimate.
+The two x86-only wake sources are meant to be fed as their training mean on other architectures (the weights were trained with them dropped out). Nap builds for x86-64 only today; this is the seam for a port.
 
-### Ordinal Survival Head
+### Network
 
-For each idle-state boundary *k*, the network's survival probability is a proportional-odds model over the shared score:
+The eight **time features** enter through a piecewise-linear embedding: 16 knots one octave apart (2^9 … 2^24 ns), the two knots around the value are mixed with linear weights. This lets the first layer represent sharp thresholds in time, which a plain linear layer cannot. The eight dense features are standardised.
 
-```
-q_nn_k = sigmoid(s − thr_ord[k−1])
-```
+| Part | Shape | Parameters |
+|---|---|---|
+| Time-feature embedding tables | 8 features × 16 knots × 128 hidden | 16 384 |
+| Dense-feature rows | 8 features × 128 hidden | 1 024 |
+| Hidden bias | 128 (ReLU) | 128 |
+| Output weights | 128 × 16 (sigmoid): `P(idle ≥ 2^(9+g) ns)` | 2 048 |
+| Output bias | 16 | 16 |
+| **Total** | | **19 600** |
 
-with one ordered threshold `thr_ord[k−1]` per boundary, seeded at `log2(target_residency[k])`. This represents the idle-duration distribution at exactly the points the decision needs (the sufficient statistic), rather than a single point estimate.
+That is 78 KB of float32 weights per CPU (each CPU learns its own copy), about 80 KB with its state. An idle touches only 24 of the 136 first-layer rows, so a forward pass is about 5 100 multiply-adds and a learning step about 7 200. Forward pass ≈ 180 ns, learning step ≈ 290 ns (boot self-test, AVX2 / AVX-512).
 
-### Decision Layer
+The open-ended last bin uses the training-data mean (65.5 ms) as its representative time. Idles are labelled by the grid thresholds they reach; labels the tick makes unknowable are masked.
 
-The decision shrinks the NN prior toward observed data — a per-CPU decayed histogram `bin_count[]` of how often recent idles reached each depth — via Beta-Binomial shrinkage:
+### Decision
 
-```
-q_k = (K · q_nn_k + count(idle ≥ k)) / (K + total),   K = 16 pseudo-observations
-```
+The output gives a distribution over the idle length. For each candidate (state, stop the tick or not) Nap integrates over it:
 
-The NN drives cold start; the floor takes over as samples accumulate. This shrinkage is what replaces a mixture of experts: it carries any multimodality of the idle distribution, and it keeps decisions stable even if the NN drifts. A running minimum enforces a monotone non-increasing survival curve, and the next timer event caps the reachable depth (`q_k = 0` for any state whose target residency lies past the next timer — it cannot be earned).
+- **E**, the expected energy: relative per-state powers (`power_milli`, default a generic ladder), break-even from `target_residency`, and the cost of stopping and restarting the tick.
+- **L**, the expected avoidable wakeup latency: for every idle length, `exit_latency` of the candidate minus `exit_latency` of the deepest state whose `target_residency` fits it (never below zero). With the tick kept, the last piece of the idle is judged.
 
-Nap then selects the **deepest feasible** state — enabled, and with `exit_latency_ns ≤` the PM QoS latency request — whose survival `q_k` still meets the confidence level (default 0.5).
+It picks the candidate with the lowest `E + λ·L`. The tick is never stopped when the next timer is closer than one tick: nothing can be saved, and the slow tick restart delays the wakeup. PM QoS limits and disabled states are honoured as before. When no C-state can pay off within the predicted sleep, POLL is returned without running the network.
 
-### POLL Short-Circuit Fast Path
+### Budget controller
 
-Before invoking the NN, `nap_select()` checks whether the predicted sleep length is shorter than the shallowest valid C-state's target residency. If so, POLL is returned immediately — no feature extraction, no inference, no history update. This eliminates NN overhead for very short idles.
+Per CPU, the share of the time lost to avoidable latency (an EWMA of the latency over an EWMA of the cycle time, busy period plus idle) is compared with `budget_ppm`: above 105 % of it λ rises by 2 %, below it λ falls by 2 %.
 
-- The shallowest valid C-state is cached per-CPU and invalidated when the PM QoS latency request changes or after `NAP_MIN_STATE_REFRESH_JIFFIES` (1 second).
-- `poll_limit_ns` is set to `sleep_length + 1 µs` margin, clamped between 1 µs and the shallowest C-state's target residency.
-- `nap_reflect()` skips history, learning, the floor sample, and all NN-related bookkeeping for short-circuited events, updating only the aggregate residency statistic. This prevents noisy POLL-duration samples from contaminating the NN's training distribution.
+### Learning
 
-### Input Features
+One SGD step per idle on the masked cross-entropy of the grid outputs (learning rate 0.02). The weights start from a pretrained prior (trained offline on ten recordings of different loads from one machine and bundled with the patch); `reset_weights` returns to it. After about 8 s (2 000 idles of a CPU) a good part of the mismatch between the prior and the actual workload is gone; it takes minutes to settle.
 
-The 8 input features are selected via gradient-based importance analysis, retaining only those with significant contribution to selection quality:
+### SIMD
 
-| # | Feature | Description |
-|---|---------|-------------|
-| 0 | log2(sleep_length) | Next timer event (primary signal) |
-| 1 | log2(last_residency) | Actual duration of last idle |
-| 2 | log_hist avg | Average of recent idle durations (log2 ring buffer) |
-| 3 | log_hist min | Shortest recent idle (overshoot guard) |
-| 4 | log_hist max | Longest recent idle (deep state signal) |
-| 5 | signed log2(\|pred_error\|+1) | Prediction feedback (sign-preserving) |
-| 6 | log2(busy_ns) | Pre-idle busy duration |
-| 7 | log2(lat_req) − log2(deepest_lat) | PM QoS headroom in log2 space |
-
-### Online Learning
-
-The decayed-histogram floor updates on **every** (non-short-circuited) idle, keeping the data term current. The trunk and ordinal thresholds update on a throttled schedule — a dual gate fires only when the reflect counter reaches `learn_interval` (default 4) **and** at least one jiffy has elapsed since the last step. The time gate caps weight churn on workloads with very rapid idle bursts; it has no effect on steady workloads.
-
-The loss is the proportional-odds (ordinal) log-likelihood. Because all boundaries share the score `s`, the gradient with respect to `s` collapses to a single scalar:
-
-```
-g = Σ_k (q_k − y_k),   y_k = 1 if measured_residency ≥ target_residency[k] else 0
-```
-
-which drives the SIMD trunk backpropagation; each ordered threshold additionally moves by its own `(q_k − y_k)`. The loss is **symmetric** — all responsiveness lives in the decision-layer confidence dial, not in an asymmetric learning signal. Gradients are element-wise clipped to `[−max_grad_norm, +max_grad_norm]`.
-
-### Weight Initialization
-
-- Hidden layer: Xavier uniform (deterministic PRNG)
-- Output (score) weights: near-zero, for ~0 initial learned contribution
-- All biases: zero
-- **Neuron 0 pass-through**: `w_h1[0][0] = 1.0`, `w_out[0] = 1.0`, all other inputs to neuron 0 zeroed
-
-The pass-through initialization makes the initial score `s ≈ log2(sleep_length)`, and the thresholds are seeded at each boundary's `log2(target_residency)`, so before any learning the decision reproduces the classic "deepest state that fits the predicted sleep" behavior.
-
-### SIMD Dispatch
-
-At governor enable time, Nap probes the CPU feature set and selects the fastest available implementation:
-
-1. AVX2 + FMA (8 hidden neurons = 1 ymm register)
-2. SSE2 (baseline; 8 hidden neurons = 2 xmm registers)
-
-AVX-512 is intentionally not used: with an 8-wide hidden layer a zmm register would run half-empty for the same instruction count, and on Intel parts the AVX-512 frequency license would hurt wakeup latency. All FPU/SIMD code is compiled into separate translation units and wrapped in `kernel_fpu_begin()`/`kernel_fpu_end()` to prevent corruption of userspace FPU state.
+Scalar, SSE2, AVX2+FMA and AVX-512 versions share one template and run on the same data layout; `max_simd=scalar|sse2|avx2|avx512` caps the level. At boot each level is checked against the offline model and against the scalar reference, and a level that disagrees is never used. All floating-point code is compiled separately and wrapped in `kernel_fpu_begin()` / `kernel_fpu_end()`. Building needs GCC 12 or later, or clang.
 
 ## Tunables
 
-Exposed under `/sys/devices/system/cpu/nap/`:
+Under `/sys/devices/system/cpu/nap/`:
 
-| Tunable | Default | Description |
+| File | Default | Description |
 |---|---|---|
-| `version` | *(read-only)* | Governor version |
-| `simd` | *(read-only)* | Detected SIMD capability (`sse2` / `avx2`) |
-| `stats` | *(read-only)* | Total selects, residency, overshoot count/rate, learn count |
-| `learning_rate` | `1` | Learning rate in thousandths (1 = 0.001) |
-| `learn_interval` | `4` | Backpropagation frequency (every N reflects) |
-| `confidence` | `500` | Decision confidence in thousandths (500 = 0.5; range 1–999). A state is chosen only if its survival probability clears this. **Higher** = more conservative (shallower, lower wakeup-latency risk); **lower** = more aggressive (deeper, more energy savings). |
-| `reset_weights` | *(write-only)* | Trigger weight reinitialization (`all` or cpulist, e.g. `0-3,5,7`) |
-| `reset_stats` | *(write-only)* | Reset statistics counters |
+| `version`, `simd`, `stats` | read-only | Version, active SIMD level, counters: selects, overshoot, `avoidable_wake_latency_ns` (also per select), learn count, stop-tick count, entries per state |
+| `budget_ppm` | `4000` | Share of the time (ppm) a CPU may lose to avoidable wakeup latency. Lower = more responsive, more power |
+| `max_simd` | highest supported | `scalar` / `sse2` / `avx2` / `avx512` |
+| `learning_rate` | `20` | In thousandths (20 = 0.02) |
+| `learn` | `1` | `0` freezes the weights |
+| `power_milli` | `1000,500,200,50,30,20,14,10,7,5` | Relative power per state, shallowest first. Machine dependent |
+| `tick_stop_cost_ns`, `tick_wake_cost_ns` | `3000`, `5000` | Energy cost of stopping the tick and of a tick wakeup |
+| `weights`, `weights_cpu` | root only | Dump / load the weights of a CPU (or of all) |
+| `reset_weights` | write-only | Back to the built-in model (`all` or a cpulist) |
+| `reset_stats` | write-only | Clear the counters |
 
-## Benchmark: selection quality vs `teo`
+## Keeping what it learned
 
-Selection quality is measured with the governor-agnostic cpuidle `above`/`below`/`usage` counters (the kernel's own per-state miss accounting), so it is an oracle metric, not a governor self-report:
+What the network has learned survives re-enabling a CPU (hotplug, suspend, governor switch) and can be saved across reboots:
 
-- **miss%** = (above + below) / usage — overall mis-selection (lower is better)
-- **above%** = overshoot (too deep; a wakeup-latency cost)
-- **below%** = undershoot (too shallow; an energy cost)
-
-`teo` is **co-measured in the same boot** as a drift anchor — a single governor's absolute miss% drifts between boots with thermal/frequency state, so the meaningful signal is the `nap − teo` margin. Harness: `tests/` (16-CPU x86_64, AVX2, 5 reps, 3 s warmup + 10 s window).
-
-### Synthetic sweep — miss% across fixed idle durations
-
-| idle duration | **nap** | teo | nap advantage |
-|---|---|---|---|
-| 10 µs | **0.96** | 1.98 | 2.1× |
-| 50 µs | **0.44** | 6.00 | **13.6×** |
-| 200 µs | **0.99** | 7.97 | 8.1× |
-| 1 ms | **4.87** | 18.11 | 3.7× (and lower power: 7.26 W vs 8.13 W) |
-| 5 ms | **13.36** | 15.14 | 1.1× |
-
-### Real workloads — miss%
-
-| workload | **nap** | teo |
-|---|---|---|
-| pingpong (cross-CPU non-timer wakeups, intercept regime) | **3.44** | 7.02 |
-| fio (bursty IO with think-time, iowait regime) | **1.22** | 1.88 |
-| idle (desktop-idle mix) | **25.50** | 26.63 (nap also lower power: 6.77 W vs 6.86 W) |
-
-nap selects more accurately than `teo` at every operating point measured — 3–13× fewer mis-selections on the synthetic sweep and ~2× on the intercept-heavy pingpong workload — at equal or lower package power. The reproduction harness, raw CSVs, and full methodology (including the boot-to-boot drift analysis) live in `tests/` and `v0.5.0-port-validation.md`.
+- `/sys/devices/system/cpu/nap/weights` dumps (read) or loads (write) the weights of the CPU chosen in `weights_cpu`. The kernel rejects a blob with a wrong header, checksum or shape, or with a NaN, an infinity or a weight of 1024 or more.
+- `tools/napctl` exports, imports, inspects and averages them and keeps them in `/var/lib/nap`; `nap-state.service` restores them at boot and saves them at shutdown, and a timer saves every 30 minutes. A state file from another machine (CPU model or idle-state table) is ignored unless forced.
+- `tools/napviz.html` is a single-file viewer: weight histograms, the embedding curves, predictions and decisions for conditions you set, and a side-by-side comparison of two dumps. Open it in a browser and drop a dump on it.
 
 ## Installation
 
@@ -152,7 +146,7 @@ Nap is delivered as a kernel patch. Apply the patch for your kernel version from
 
 ```sh
 cd /path/to/linux
-patch -p1 < /path/to/nap/patches/stable/<kernel-version>-nap-v0.5.0.patch
+patch -p1 < /path/to/nap/patches/stable/<kernel-version>-nap-<version>.patch
 ```
 
 ### Activate

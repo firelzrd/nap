@@ -1,0 +1,32 @@
+napctl and the nap-state units keep what the nap cpuidle governor has learned.
+
+  napctl export FILE        dump the weights of all online CPUs
+  napctl import FILE        load a state file (or a single blob); --cpu N for one CPU
+  napctl info FILE          describe a state file or blob
+  napctl average OUT IN...  average blobs (for a prior shared by all CPUs)
+  napctl save / restore     keep / load /var/lib/nap/state (the previous state stays as state.prev)
+  napctl reset              back to the built-in default model
+
+Install:
+  install -m 755 napctl /usr/local/sbin/napctl
+  install -m 644 nap-state.service nap-state-save.service nap-state-save.timer /etc/systemd/system/
+  systemctl enable --now nap-state.service nap-state-save.timer
+
+nap-state.service restores the weights when the system comes up and saves them when it
+goes down; the timer saves every 30 minutes so that a crash costs at most that much.
+A state file made on another machine (different CPU model or idle-state table) is
+ignored unless forced; a kernel with another network shape rejects it.
+
+Kernel interface (root only): /sys/devices/system/cpu/nap/weights_cpu selects a CPU or
+"all"; reading .../weights dumps that CPU, writing a whole blob loads it.  The kernel
+checks the header, the checksum and that every weight is finite and below 1024.
+reset_weights returns to the built-in default.
+
+napviz.html -- a single-file viewer for the network (open it in a browser, no server needed):
+  weight histograms, the embedding tables and sensitivity curves, predictions for conditions you set with
+  sliders, and the governor's decision (state and tick choice, with a map over time-to-timer and lambda).
+  The built-in default model is embedded; drop a dump (a single blob or a `napctl export` state file) on
+  the page to load a second model B and compare it with A.
+  Rebuild after changing the network: python3 napviz/build.py <kernel>/drivers/cpuidle/governors/nap
+  Check the viewer's forward pass against the kernel's self-test vectors:
+  node napviz/test_core.js <kernel>/drivers/cpuidle/governors/nap

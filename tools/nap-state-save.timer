@@ -1,0 +1,9 @@
+[Unit]
+Description=Save the learned nap weights every 30 minutes
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target
