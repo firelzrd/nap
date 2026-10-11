@@ -1,13 +1,13 @@
-From f5bbb9f18f104519f92d26353218e6d6d3a30f15 Mon Sep 17 00:00:00 2001
+From 8fda0617beca5881bcbfaf2add92c8786bf41c56 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 11 Oct 2026 20:20:13 +0900
-Subject: [PATCH] 6.12-nap-v0.6.0
+Date: Mon, 12 Oct 2026 07:12:32 +0900
+Subject: [PATCH] 6.12-nap-v0.6.1
 
 ---
  drivers/cpuidle/Kconfig                       |   24 +
  drivers/cpuidle/governors/Makefile            |    1 +
  drivers/cpuidle/governors/nap/Makefile        |   37 +
- drivers/cpuidle/governors/nap/nap.c           | 1268 +++++++++
+ drivers/cpuidle/governors/nap/nap.c           | 1287 +++++++++
  drivers/cpuidle/governors/nap/nap.h           |  117 +
  drivers/cpuidle/governors/nap/nap_dims.h      |   18 +
  drivers/cpuidle/governors/nap/nap_fpu.c       |  505 ++++
@@ -19,7 +19,7 @@ Subject: [PATCH] 6.12-nap-v0.6.0
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   |   11 +
  drivers/cpuidle/governors/nap/nap_selftest.h  |  169 ++
  drivers/cpuidle/governors/nap/nap_weights.h   | 2470 +++++++++++++++++
- 15 files changed, 4927 insertions(+)
+ 15 files changed, 4946 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -123,10 +123,10 @@ index 0000000000..fe201249ab
 +CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma -mavx512f -mprefer-vector-width=512
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..f1c3ea4ff6
+index 0000000000..a0512f6763
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
-@@ -0,0 +1,1268 @@
+@@ -0,0 +1,1287 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap.c — Neural Adaptive Predictor cpuidle governor
@@ -234,7 +234,7 @@ index 0000000000..f1c3ea4ff6
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.6.0"
++#define CPUIDLE_NAP_VERSION  "0.6.1"
 +
 +/* ================================================================
 + * Tunables (sysfs)
@@ -529,11 +529,20 @@ index 0000000000..f1c3ea4ff6
 +	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
 +	u32 dd, dl, dr, dc, tot;
 +	u64 now, meas, net, tgt, cyc;
++	bool expired;
 +	int i;
 +
 +	if (!d->active || !drv)
 +		return;
 +	d->active = false;
++	/*
++	 * POLL was left because its time limit expired, not because of a
++	 * wakeup: the idle period is not over.
++	 */
++	expired = dev->poll_time_limit && index >= 0 &&
++		  index < drv->state_count &&
++		  (drv->states[index].flags & CPUIDLE_FLAG_POLLING);
++	dev->poll_time_limit = false;
 +	if (atomic_dec_return(&nap_nr_idle) < 0)
 +		atomic_set(&nap_nr_idle, 0);
 +
@@ -546,12 +555,22 @@ index 0000000000..f1c3ea4ff6
 +	/* busy period + idle: the wall-clock time this idle accounts for */
 +	cyc = d->prev_ref_ts ? now - d->prev_ref_ts : 0;
 +	d->prev_ref_ts = now;
-+	WRITE_ONCE(nap_wake_ts[(u32)atomic_inc_return(&nap_wake_idx) %
-+			       NAP_WAKE_RING], now);
++	/* an expired POLL time limit is not a wakeup */
++	if (!expired)
++		WRITE_ONCE(nap_wake_ts[(u32)atomic_inc_return(&nap_wake_idx) %
++				       NAP_WAKE_RING], now);
 +
 +	if (index < 0 || index >= drv->state_count)
 +		return;
 +	meas = dev->last_residency_ns;
++	/*
++	 * Like teo and menu, assume that the CPU could have been idle for
++	 * the whole predicted sleep length.  Taking the truncated time as
++	 * the measurement teaches the model that idles are short and it
++	 * keeps selecting POLL.
++	 */
++	if (expired && d->sleep_ns > meas)
++		meas = d->sleep_ns;
 +	net = meas > drv->states[index].exit_latency_ns ?
 +	      meas - drv->states[index].exit_latency_ns : 0;
 +	tgt = drv->states[index].target_residency_ns;
