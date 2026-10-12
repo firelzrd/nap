@@ -15,7 +15,11 @@ Install:
 nap-state.service restores the weights when the system comes up and saves them when it
 goes down; the timer saves every 30 minutes so that a crash costs at most that much.
 A state file made on another machine (different CPU model or idle-state table) is
-ignored unless forced; a kernel with another network shape rejects it.
+ignored unless forced.  So is one made by a nap with another network shape (v0.6.1 and
+earlier: 16 features, 128 hidden units; v0.6.5: 11 features, 32 hidden units): napctl says
+so, the built-in model stays, and the next save replaces the old file (kept as state.prev).
+`napctl info FILE` prints the network shape of a file and whether the running kernel has the
+same one.
 
 Kernel interface (root only): /sys/devices/system/cpu/nap/weights_cpu selects a CPU or
 "all"; reading .../weights dumps that CPU, writing a whole blob loads it.  The kernel
@@ -27,6 +31,8 @@ napviz.html -- a single-file viewer for the network (open it in a browser, no se
   sliders, and the governor's decision (state and tick choice, with a map over time-to-timer and lambda).
   The built-in default model is embedded; drop a dump (a single blob or a `napctl export` state file) on
   the page to load a second model B and compare it with A.
+  The built-in default model and the feature list are those of the kernel it was built from
+  (v0.6.5: 11 features, 32 hidden units); a dump with another shape is refused with both shapes shown.
   Rebuild after changing the network: python3 napviz/build.py <kernel>/drivers/cpuidle/governors/nap
   Check the viewer's forward pass against the kernel's self-test vectors:
   node napviz/test_core.js <kernel>/drivers/cpuidle/governors/nap

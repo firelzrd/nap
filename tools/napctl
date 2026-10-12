@@ -49,6 +49,21 @@ def dims(blob):
     return dict(zip(("fmt", "nt", "nk", "nd", "nhid", "nout", "first", "tail_rep"), f[1:9]))
 
 
+def describe(d):
+    """One line for a dims dict: the shape of the network a blob belongs to."""
+    return (f"{d['nt']} time features x {d['nk']} knots + {d['nd']} dense features, "
+            f"{d['nhid']} hidden units, {d['nout']} outputs")
+
+
+def kernel_dims():
+    """Shape of the network the running kernel has, from the first CPU that has learned something (None if no CPU has)."""
+    for c in online_cpus():
+        blob = try_dump(c)
+        if blob is not None:
+            return dims(blob)
+    return None
+
+
 def machine_signature():
     """What the weights are tied to: CPU model and the cpuidle state table."""
     parts = []
@@ -104,7 +119,8 @@ def load_blob(blob, cpu="all"):
     try:
         os.write(fd, blob)
     except OSError as e:
-        die(f"the kernel rejected the weights: {os.strerror(e.errno)}")
+        die(f"the kernel rejected the weights: {os.strerror(e.errno)}"
+            " (a blob from a nap with another network shape, or a damaged one; compare `napctl info` of the blob with the kernel's)")
     finally:
         os.close(fd)
 
@@ -169,6 +185,12 @@ def apply_state(path, force=False, cpu=None):
         print(f"napctl: {path} belongs to another machine or idle-state table; ignored (--force to load anyway)",
               file=sys.stderr)
         return False
+    if recs:
+        mine, theirs = kernel_dims(), dims(recs[0][1])
+        if mine is not None and mine != theirs and not force:
+            print(f"napctl: {path} was made by a nap with another network ({describe(theirs)}); "
+                  f"this kernel has {describe(mine)}; ignored", file=sys.stderr)
+            return False
     have = dict(recs)
     mean = average([b for _, b in recs]) if recs else None
     for c in ([cpu] if cpu is not None else online_cpus()):
@@ -182,7 +204,8 @@ def cmd_import(a):
     with open(a.file, "rb") as fh:
         head = fh.read(8)
     if head == STATE_MAGIC:
-        apply_state(a.file, a.force, a.cpu)
+        if not apply_state(a.file, a.force, a.cpu):
+            sys.exit(1)
     else:
         with open(a.file, "rb") as fh:
             load_blob(fh.read(), "all" if a.cpu is None else a.cpu)
@@ -200,7 +223,12 @@ def cmd_info(a):
     else:
         blobs = [data]
     for i, b in enumerate(blobs[:1]):
-        print("dims:", dims(b))
+        d = dims(b)
+        print("dims:", d)
+        print("network:", describe(d))
+        mine = kernel_dims() if os.path.exists(f"{SYSFS}/weights") else None
+        if mine is not None:
+            print("this kernel:", "same network" if mine == d else f"DIFFERENT network ({describe(mine)}); the kernel would reject it")
     for i, b in enumerate(blobs):
         w = array.array("f", b[HDR.size:])
         print(f"  blob {i}: {len(w)} weights, max |w| {max(abs(x) for x in w):.3f}, "

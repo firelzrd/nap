@@ -3,13 +3,11 @@
 "use strict";
 const NAPC = (() => {
   const D = NAP_DATA;                       // {NT,NK,ND,NHID,NOUT,FIRST,TAIL_REP,mu[],sd[], inputSig}
-  const NROW = D.NT * D.NK + D.ND, NNZ = 2 * D.NT + D.ND, NB = D.NOUT + 1;
-  const TI = [0, 7, 8, 9, 10, 11, 12, 5], DI = [1, 2, 3, 4, 6, 13, 14, 15];
+  const NROW = D.NT * D.NK + D.ND, NNZ = 2 * D.NT + D.ND, NB = D.NOUT + 1, NFEAT = D.NT + D.ND;
+  const TI = [0, 1, 2, 3, 4, 5, 6], DI = [7, 8, 9, 10];          // positions in the feature vector: times, then dense features
   const FEATURES = [
-    "time to next timer (log2 ns)", "tick ratio (log2 sleep/tick)", "busy CPUs (log1p)", "wakes in last 50us (log1p)", "wakes in last 1ms (log1p)",
-    "last busy period (log2 ns)", "irqs while busy (log1p)",
-    "idle history h1 (log2 ns)", "h2", "h3", "h4", "h5", "h6",
-    "last wake: device irq (log1p)", "last wake: local timer (log1p)", "last wake: call IPI (log1p)"];
+    "time to next timer (log2 ns)", "idle history h1 (log2 ns)", "h2", "h3", "h4", "h5", "last busy period (log2 ns)",
+    "tick ratio (log2 sleep/tick)", "busy CPUs (log1p)", "last wake: device irq (log1p)", "last wake: local timer (log1p)"];
 
   // ---- crc32 as the kernel's crc32_le(~0, data): zlib crc32 without the final inversion
   const T32 = new Uint32Array(256);
@@ -25,7 +23,7 @@ const NAPC = (() => {
     const f = []; for (let i = 0; i < 12; i++) f.push(dv.getUint32(8 + 4 * i, true));
     const [fmt, nt, nk, nd, nhid, nout, first, tail, pbytes, crc, sig] = f;
     if (fmt !== 1 || nt !== D.NT || nk !== D.NK || nd !== D.ND || nhid !== D.NHID || nout !== D.NOUT || first !== D.FIRST)
-      throw new Error("network shape differs from this viewer");
+      throw new Error(`network shape differs from this viewer (file: ${nt} time x ${nk} knots + ${nd} dense, ${nhid} hidden, ${nout} outputs; viewer: ${D.NT} x ${D.NK} + ${D.ND}, ${D.NHID} hidden, ${D.NOUT} outputs)`);
     if (buf.byteLength !== HDR + pbytes) throw new Error("size does not match the header");
     const crcOk = kcrc(u8.subarray(HDR)) === crc;
     const n1 = NROW * D.NHID, nw2 = D.NOUT * D.NHID;
@@ -116,11 +114,11 @@ const NAPC = (() => {
   /* default feature vector for a quiet system with a 1 ms tick */
   function defaultFeatures() {
     const sleep = 20, tickNs = 1e6;       // log2(1e6)~19.93
-    const x = new Array(16).fill(0);
-    x[0] = sleep; x[1] = sleep - Math.log2(tickNs); x[2] = Math.log1p(1); x[3] = Math.log1p(0); x[4] = Math.log1p(2);
-    x[5] = 16; x[6] = Math.log1p(2); for (let i = 7; i <= 12; i++) x[i] = 17; x[13] = Math.log1p(1); x[14] = Math.log1p(1); x[15] = Math.log1p(0);
+    const x = new Array(NFEAT).fill(0);
+    x[0] = sleep; for (let i = 1; i <= 5; i++) x[i] = 17; x[6] = 16; x[7] = sleep - Math.log2(tickNs);
+    x[8] = Math.log1p(1); x[9] = Math.log1p(1); x[10] = Math.log1p(1);
     return x;
   }
-  return { D, NROW, NNZ, NB, TI, DI, FEATURES, parseBlob, parseState, encode, forward, decide, binProbs, binTimes, expectedIdle, defaultFeatures, kcrc, ideal };
+  return { D, NROW, NNZ, NB, NFEAT, TI, DI, FEATURES, parseBlob, parseState, encode, forward, decide, binProbs, binTimes, expectedIdle, defaultFeatures, kcrc, ideal };
 })();
 if (typeof module !== "undefined") module.exports = NAPC;
